@@ -233,7 +233,7 @@ class KlineModelResearchTests(unittest.TestCase):
         )
         trade = simulate_position(setup, future)
         self.assertEqual("trailing_stop", trade.exit_reason)
-        self.assertAlmostEqual(0.0332, trade.realized_return, places=4)
+        self.assertAlmostEqual(0.0250, trade.realized_return, places=4)
 
 
 if __name__ == "__main__":
@@ -257,7 +257,7 @@ Create `TradeSetup`, `ExitRule`, `CompletedTrade`, and `simulate_position` in `k
 - Use `entry_price`.
 - Apply `initial_stop`.
 - Track highest high after entry.
-- Apply `trailing_drawdown`.
+- Apply `trailing_drawdown` from the highest high confirmed before the current bar. Do not assume the current bar's high occurred before its low.
 - Exit by max holding bars when no stop is hit.
 - Return realized return and exit reason.
 
@@ -415,3 +415,21 @@ Expected: all tests pass.
 - Spec coverage: covers `agent.md` execution gates, 10-year A-share data, low-frequency holding period, strict stops, positive expectancy, data-source fallback, no unapproved dependency installation, and final report requirements.
 - Placeholder scan: no `TBD`, `TODO`, or unspecified implementation gates remain.
 - Type consistency: planned `TradeSetup`, `ExitRule`, `CompletedTrade`, and `simulate_position` are introduced before later tasks reference them.
+
+## Execution Notes
+
+- PortableGit path verified through explicit `--git-dir` and `--work-tree` usage because the sandbox cannot write `.git` directly.
+- `agent.md` was saved after user approval.
+- `kline_model_research.py` and `tests/test_kline_model_research.py` were created with a shared weekly-bar research harness, candidate signal functions, local cache fallback, transaction-cost adjustment, and sweep mode.
+- Unit coverage currently includes signal dispatch, default parameter consistency, no same-bar trailing-stop lookahead, non-overlapping trades, AKShare normalization, weekly aggregation, nonpositive OHLC filtering, and sweep ranking.
+- Pure trailing-stop trend/breakout models did not meet the >50% win-rate requirement on the cached 100-stock sample; best broad sweep win rate was about 29.14%.
+- Strong-trend filtering improved expectancy but not win rate. The closest trend-running versions stayed below 50% win rate.
+- A candidate using strong-trend pullback restart plus fixed +15% profit target and -12% stop loss passed the hard win-rate/expectancy requirement on the first 200 non-ST cached stocks:
+  - 222 non-overlapping trades
+  - 51.35% win rate
+  - 1.61% average return per trade after estimated costs
+  - 14.46% average winner
+  - -11.95% average loser
+  - 1.21 profit/loss ratio
+- Candidate report: `reports/kline_models_candidate_10y_limit200/summary.md`.
+- Remaining validation: broaden beyond 200 stocks and add train/validation/test date splits before treating the model as robust.

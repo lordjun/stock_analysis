@@ -16,6 +16,8 @@ MODEL_NAMES = [
     "trend_pullback_restart",
     "consolidation_breakout",
     "breakout_pullback_restart",
+    "stage_high_breakout_retest",
+    "jianghua_acceleration_retest",
     "uptrend_bullish_engulfing",
 ]
 
@@ -560,6 +562,240 @@ def find_breakout_pullback_restarts(
     return signals
 
 
+def find_stage_high_breakout_retests(
+    bars: pd.DataFrame,
+    lookback_bars: int = 60,
+    min_base_bars: int = 30,
+    max_retest_bars: int = 10,
+    breakout_buffer: float = 0.005,
+    support_tolerance: float = 0.015,
+    min_pullback_pct: float = 0.03,
+    max_extension_pct: float = 0.08,
+    ma_fast: int = 20,
+    ma_slow: int = 60,
+    first_retest_only: bool = True,
+) -> list[PatternSignal]:
+    df = _prepare_bars(bars)
+    df["ma_fast"] = df["close"].rolling(ma_fast).mean()
+    df["ma_slow"] = df["close"].rolling(ma_slow).mean()
+    signals: list[PatternSignal] = []
+
+    first_breakout = max(lookback_bars, min_base_bars, ma_slow)
+    for breakout_index in range(first_breakout, len(df) - 1):
+        prior_window = df.iloc[breakout_index - lookback_bars : breakout_index]
+        base_window = df.iloc[breakout_index - min_base_bars : breakout_index]
+        prior_high = float(prior_window["high"].max())
+        base_low = float(base_window["low"].min())
+        breakout_close = float(df.at[breakout_index, "close"])
+        breakout_high = float(df.at[breakout_index, "high"])
+        breakout_low = float(df.at[breakout_index, "low"])
+        fast = float(df.at[breakout_index, "ma_fast"])
+        slow = float(df.at[breakout_index, "ma_slow"])
+
+        broke_stage_high = breakout_close >= prior_high * (1 + breakout_buffer)
+        had_trend = breakout_close > fast > slow
+        if not (broke_stage_high and had_trend):
+            continue
+
+        latest_index = min(len(df), breakout_index + max_retest_bars + 1)
+        for retest_index in range(breakout_index + 1, latest_index):
+            retest = df.iloc[breakout_index + 1 : retest_index + 1]
+            pullback_low = float(retest["low"].min())
+            latest_close = float(df.at[retest_index, "close"])
+            latest_low = float(df.at[retest_index, "low"])
+            highest_after_breakout = float(df.iloc[breakout_index : retest_index + 1]["high"].max())
+
+            held_prior_high = pullback_low >= prior_high * (1 - support_tolerance)
+            did_pullback = latest_low <= highest_after_breakout * (1 - min_pullback_pct)
+            not_too_extended = latest_close <= prior_high * (1 + max_extension_pct)
+            close_above_support = latest_close >= prior_high * (1 - support_tolerance)
+            if held_prior_high and did_pullback and not_too_extended and close_above_support:
+                signals.append(
+                    PatternSignal(
+                        model="stage_high_breakout_retest",
+                        signal_index=retest_index,
+                        signal_date=pd.Timestamp(df.at[retest_index, "date"]),
+                        trigger_price=latest_close,
+                        initial_stop=prior_high * (1 - support_tolerance),
+                        metadata={
+                            "breakout_index": float(breakout_index),
+                            "breakout_date_ordinal": float(pd.Timestamp(df.at[breakout_index, "date"]).toordinal()),
+                            "prior_high": prior_high,
+                            "breakout_close": breakout_close,
+                            "breakout_high": breakout_high,
+                            "breakout_low": breakout_low,
+                            "pullback_low": pullback_low,
+                            "days_since_breakout": float(retest_index - breakout_index),
+                            "distance_to_prior_high": latest_close / prior_high - 1,
+                            "drawdown_from_breakout_high": pullback_low / highest_after_breakout - 1,
+                            "base_low": base_low,
+                            "ma_fast": fast,
+                            "ma_slow": slow,
+                        },
+                    )
+                )
+                if first_retest_only:
+                    break
+
+    return signals
+
+
+def find_jianghua_acceleration_retests(
+    bars: pd.DataFrame,
+    structure_lookback_bars: int = 60,
+    min_base_bars: int = 30,
+    max_peak_bars: int = 5,
+    max_retest_bars: int = 10,
+    breakout_buffer: float = 0.005,
+    support_tolerance: float = 0.02,
+    min_flagpole_pct: float = 0.15,
+    max_flagpole_pct: float = 0.45,
+    min_peak_drawdown_pct: float = 0.10,
+    max_peak_drawdown_pct: float = 0.28,
+    min_close_above_support_pct: float = 0.02,
+    max_close_above_support_pct: float = 0.09,
+    min_breakout_volume_ratio: float = 1.5,
+    max_pullback_volume_ratio: float = 0.8,
+    ma_fast: int = 20,
+    ma_slow: int = 60,
+    first_retest_only: bool = True,
+) -> list[PatternSignal]:
+    df = _prepare_bars(bars)
+    df["ma_fast"] = df["close"].rolling(ma_fast).mean()
+    df["ma_slow"] = df["close"].rolling(ma_slow).mean()
+    signals: list[PatternSignal] = []
+
+    first_breakout = max(structure_lookback_bars, min_base_bars, ma_slow)
+    for breakout_index in range(first_breakout, len(df) - 2):
+        prior_window = df.iloc[breakout_index - structure_lookback_bars : breakout_index]
+        base_window = df.iloc[breakout_index - min_base_bars : breakout_index]
+        structure_high = float(prior_window["close"].max())
+        base_low = float(base_window["low"].min())
+        breakout_close = float(df.at[breakout_index, "close"])
+        fast = float(df.at[breakout_index, "ma_fast"])
+        slow = float(df.at[breakout_index, "ma_slow"])
+        prior_avg_volume = float(prior_window.tail(20)["volume"].mean())
+
+        broke_structure_high = breakout_close >= structure_high * (1 + breakout_buffer)
+        had_trend = breakout_close > fast > slow
+        if not (broke_structure_high and had_trend and prior_avg_volume > 0):
+            continue
+
+        latest_peak_search_index = min(len(df), breakout_index + max_peak_bars + 1)
+        latest_retest_index = min(len(df), breakout_index + max_retest_bars + 1)
+        for retest_index in range(breakout_index + 2, latest_retest_index):
+            impulse = df.iloc[breakout_index: min(retest_index, latest_peak_search_index)]
+            if impulse.empty:
+                continue
+            peak_index = int(impulse["high"].idxmax())
+            if peak_index <= breakout_index or peak_index >= retest_index:
+                continue
+
+            peak_high = float(df.at[peak_index, "high"])
+            flagpole_pct = peak_high / structure_high - 1
+            if not (min_flagpole_pct <= flagpole_pct <= max_flagpole_pct):
+                continue
+
+            retest = df.iloc[peak_index + 1 : retest_index + 1]
+            if retest.empty:
+                continue
+            all_after_breakout = df.iloc[breakout_index + 1 : retest_index + 1]
+            pullback_low = float(all_after_breakout["low"].min())
+            latest_close = float(df.at[retest_index, "close"])
+            peak_drawdown_pct = 1 - pullback_low / peak_high
+            close_above_support_pct = latest_close / structure_high - 1
+            impulse_volume = float(df.iloc[breakout_index : peak_index + 1]["volume"].mean())
+            pullback_volume = float(retest["volume"].mean())
+
+            held_structure_high = pullback_low >= structure_high * (1 - support_tolerance)
+            drawdown_ok = min_peak_drawdown_pct <= peak_drawdown_pct <= max_peak_drawdown_pct
+            location_ok = min_close_above_support_pct <= close_above_support_pct <= max_close_above_support_pct
+            volume_ok = (
+                impulse_volume >= prior_avg_volume * min_breakout_volume_ratio
+                and pullback_volume <= impulse_volume * max_pullback_volume_ratio
+            )
+            if not (held_structure_high and drawdown_ok and location_ok and volume_ok):
+                continue
+
+            similarity = _jianghua_similarity_score(
+                flagpole_pct=flagpole_pct,
+                peak_drawdown_pct=peak_drawdown_pct,
+                close_above_support_pct=close_above_support_pct,
+                days_since_breakout=retest_index - breakout_index,
+                pullback_volume_ratio=pullback_volume / impulse_volume if impulse_volume else 9.99,
+            )
+            signals.append(
+                PatternSignal(
+                    model="jianghua_acceleration_retest",
+                    signal_index=retest_index,
+                    signal_date=pd.Timestamp(df.at[retest_index, "date"]),
+                    trigger_price=latest_close,
+                    initial_stop=structure_high * (1 - support_tolerance),
+                    metadata={
+                        "breakout_index": float(breakout_index),
+                        "peak_index": float(peak_index),
+                        "structure_high": structure_high,
+                        "base_low": base_low,
+                        "breakout_close": breakout_close,
+                        "breakout_high": float(df.at[breakout_index, "high"]),
+                        "peak_high": peak_high,
+                        "pullback_low": pullback_low,
+                        "days_since_breakout": float(retest_index - breakout_index),
+                        "days_since_peak": float(retest_index - peak_index),
+                        "flagpole_pct": flagpole_pct,
+                        "peak_drawdown_pct": peak_drawdown_pct,
+                        "close_above_support_pct": close_above_support_pct,
+                        "prior_avg_volume": prior_avg_volume,
+                        "impulse_volume": impulse_volume,
+                        "pullback_volume": pullback_volume,
+                        "pullback_volume_ratio": pullback_volume / impulse_volume if impulse_volume else 0.0,
+                        "similarity_score": similarity,
+                        "ma_fast": fast,
+                        "ma_slow": slow,
+                    },
+                )
+            )
+            if first_retest_only:
+                break
+
+    return signals
+
+
+def _jianghua_similarity_score(
+    flagpole_pct: float,
+    peak_drawdown_pct: float,
+    close_above_support_pct: float,
+    days_since_breakout: int,
+    pullback_volume_ratio: float,
+) -> float:
+    targets = {
+        "flagpole_pct": 0.27,
+        "peak_drawdown_pct": 0.19,
+        "close_above_support_pct": 0.06,
+        "days_since_breakout": 7.0,
+        "pullback_volume_ratio": 0.75,
+    }
+    tolerances = {
+        "flagpole_pct": 0.14,
+        "peak_drawdown_pct": 0.10,
+        "close_above_support_pct": 0.04,
+        "days_since_breakout": 5.0,
+        "pullback_volume_ratio": 0.35,
+    }
+    values = {
+        "flagpole_pct": flagpole_pct,
+        "peak_drawdown_pct": peak_drawdown_pct,
+        "close_above_support_pct": close_above_support_pct,
+        "days_since_breakout": float(days_since_breakout),
+        "pullback_volume_ratio": pullback_volume_ratio,
+    }
+    scores = [
+        max(0.0, 1 - abs(values[key] - targets[key]) / tolerances[key])
+        for key in targets
+    ]
+    return float(sum(scores) / len(scores) * 100)
+
+
 def find_signals_for_model(model_name: str, bars: pd.DataFrame, params: dict[str, object]) -> list[PatternSignal]:
     if model_name == "weekly_box_breakout":
         return find_weekly_box_breakouts(bars, **params)
@@ -571,6 +807,10 @@ def find_signals_for_model(model_name: str, bars: pd.DataFrame, params: dict[str
         return find_consolidation_breakouts(bars, **params)
     if model_name == "breakout_pullback_restart":
         return find_breakout_pullback_restarts(bars, **params)
+    if model_name == "stage_high_breakout_retest":
+        return find_stage_high_breakout_retests(bars, **params)
+    if model_name == "jianghua_acceleration_retest":
+        return find_jianghua_acceleration_retests(bars, **params)
     raise ValueError(f"unknown model: {model_name}")
 
 
@@ -791,6 +1031,55 @@ def _sweep_param_grid(model_name: str) -> list[dict[str, object]]:
                             }
                         )
         return configs
+    if model_name == "stage_high_breakout_retest":
+        for lookback_bars in [40, 60, 90]:
+            for support_tolerance in [0.01, 0.015, 0.02]:
+                for max_retest_bars in [5, 10]:
+                    configs.append(
+                        {
+                            "lookback_bars": lookback_bars,
+                            "min_base_bars": 30,
+                            "max_retest_bars": max_retest_bars,
+                            "breakout_buffer": 0.005,
+                            "support_tolerance": support_tolerance,
+                            "min_pullback_pct": 0.03,
+                            "max_extension_pct": 0.08,
+                            "ma_fast": 20,
+                            "ma_slow": 60,
+                            "max_holding_bars": 60,
+                            "max_initial_loss": 0.08,
+                            "trailing_drawdown": 0.18,
+                        }
+                    )
+        return configs
+    if model_name == "jianghua_acceleration_retest":
+        for min_flagpole_pct in [0.15, 0.20]:
+            for min_peak_drawdown_pct in [0.08, 0.10]:
+                for support_tolerance in [0.015, 0.02]:
+                    configs.append(
+                        {
+                            "structure_lookback_bars": 60,
+                            "min_base_bars": 30,
+                            "max_peak_bars": 5,
+                            "max_retest_bars": 10,
+                            "breakout_buffer": 0.005,
+                            "support_tolerance": support_tolerance,
+                            "min_flagpole_pct": min_flagpole_pct,
+                            "max_flagpole_pct": 0.45,
+                            "min_peak_drawdown_pct": min_peak_drawdown_pct,
+                            "max_peak_drawdown_pct": 0.28,
+                            "min_close_above_support_pct": 0.02,
+                            "max_close_above_support_pct": 0.09,
+                            "min_breakout_volume_ratio": 1.5,
+                            "max_pullback_volume_ratio": 0.8,
+                            "ma_fast": 20,
+                            "ma_slow": 60,
+                            "max_holding_bars": 60,
+                            "max_initial_loss": 0.08,
+                            "trailing_drawdown": 0.18,
+                        }
+                    )
+        return configs
     raise ValueError(f"unknown model: {model_name}")
 
 
@@ -889,6 +1178,37 @@ def _default_model_params(model_name: str) -> dict[str, object]:
             "max_pullback_pct": 0.08,
             "ma_fast": 20,
             "ma_slow": 40,
+        }
+    if model_name == "stage_high_breakout_retest":
+        return {
+            "lookback_bars": 60,
+            "min_base_bars": 30,
+            "max_retest_bars": 10,
+            "breakout_buffer": 0.005,
+            "support_tolerance": 0.015,
+            "min_pullback_pct": 0.03,
+            "max_extension_pct": 0.08,
+            "ma_fast": 20,
+            "ma_slow": 60,
+        }
+    if model_name == "jianghua_acceleration_retest":
+        return {
+            "structure_lookback_bars": 60,
+            "min_base_bars": 30,
+            "max_peak_bars": 5,
+            "max_retest_bars": 10,
+            "breakout_buffer": 0.005,
+            "support_tolerance": 0.02,
+            "min_flagpole_pct": 0.15,
+            "max_flagpole_pct": 0.45,
+            "min_peak_drawdown_pct": 0.10,
+            "max_peak_drawdown_pct": 0.28,
+            "min_close_above_support_pct": 0.02,
+            "max_close_above_support_pct": 0.09,
+            "min_breakout_volume_ratio": 1.5,
+            "max_pullback_volume_ratio": 0.8,
+            "ma_fast": 20,
+            "ma_slow": 60,
         }
     if model_name == "uptrend_bullish_engulfing":
         return {"ma_fast": 10, "ma_slow": 30, "pullback_tolerance": 0.03}

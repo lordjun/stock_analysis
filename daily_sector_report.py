@@ -12,6 +12,9 @@ from pathlib import Path
 from typing import Iterable
 
 import akshare as ak
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import pandas as pd
 import py_mini_racer
@@ -99,6 +102,14 @@ def clean_stock_code(code: str) -> str:
 
 def safe_filename_part(text: str) -> str:
     return re.sub(r'[<>:"/\\|?*\s]+', "_", str(text)).strip("_") or "unknown"
+
+
+def stock_market_prefix(code: str) -> str:
+    if code.startswith(("4", "8", "920")):
+        return "bj"
+    if code.startswith(("6", "9")):
+        return "sh"
+    return "sz"
 
 
 def eastmoney_clist(fs: str, fields: str, fid: str = "f3", page_size: int = 5) -> pd.DataFrame:
@@ -574,7 +585,7 @@ def fetch_stock_hist(code: str, end_date: str, lookback_days: int) -> pd.DataFra
     start = end - dt.timedelta(days=max(lookback_days * 2, 120))
     start_text = start.strftime("%Y%m%d")
     end_text = end.strftime("%Y%m%d")
-    market_code = ("sh" if code.startswith(("6", "9")) else "sz") + code
+    market_code = stock_market_prefix(code) + code
 
     try:
         df = ak.stock_zh_a_hist(
@@ -613,7 +624,64 @@ def fetch_stock_hist(code: str, end_date: str, lookback_days: int) -> pd.DataFra
         except Exception:
             continue
 
+    try:
+        df = fetch_stock_hist_tx_direct(market_code, start_text, end_text, adjust="qfq")
+        if not df.empty:
+            df = df.rename(
+                columns={
+                    "date": "日期",
+                    "open": "开盘",
+                    "close": "收盘",
+                    "high": "最高",
+                    "low": "最低",
+                    "amount": "成交量",
+                }
+            )
+            return df.tail(lookback_days).copy()
+    except Exception:
+        pass
+
     return pd.DataFrame()
+
+
+def fetch_stock_hist_tx_direct(symbol: str, start_date: str, end_date: str, adjust: str = "qfq") -> pd.DataFrame:
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+    frames: list[pd.DataFrame] = []
+    start_year = int(start_date[:4])
+    end_year = int(end_date[:4])
+    key_order = ("day", "qfqday", "hfqday")
+
+    for year in range(start_year, end_year + 1):
+        params = {
+            "_var": f"kline_day{adjust}{year}",
+            "param": f"{symbol},day,{year}-01-01,{year + 1}-12-31,640,{adjust}",
+            "r": "0.8205512681390605",
+        }
+        response = requests.get(url, params=params, timeout=20)
+        response.raise_for_status()
+        data_text = response.text
+        payload = json.loads(data_text[data_text.find("={") + 1 :])
+        stock_data = payload.get("data", {}).get(symbol, {})
+        rows = []
+        for key in key_order:
+            if key in stock_data:
+                rows = stock_data[key]
+                break
+        if rows:
+            frames.append(pd.DataFrame(rows))
+
+    if not frames:
+        return pd.DataFrame()
+
+    df = pd.concat(frames, ignore_index=True).iloc[:, :6]
+    df.columns = ["date", "open", "close", "high", "low", "amount"]
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+    for column in ["open", "close", "high", "low", "amount"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["date"]).drop_duplicates(ignore_index=True)
+    df.index = pd.to_datetime(df["date"], errors="coerce")
+    df = df.sort_index()[start_date:end_date].reset_index(drop=True)
+    return df
 
 
 def fetch_stock_news(code: str, max_rows: int = 30) -> pd.DataFrame:

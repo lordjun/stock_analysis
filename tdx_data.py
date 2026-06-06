@@ -45,14 +45,19 @@ def read_tdx_day_file(
 
     data = file_path.read_bytes()
     rows: list[dict[str, object]] = []
-    for offset in range(0, len(data), TDX_RECORD_SIZE):
-        chunk = data[offset : offset + TDX_RECORD_SIZE]
-        if len(chunk) != TDX_RECORD_SIZE:
+    start_raw = int(pd.Timestamp(start_date).strftime("%Y%m%d")) if start_date else None
+    end_raw = int(pd.Timestamp(end_date).strftime("%Y%m%d")) if end_date else None
+    usable_size = len(data) - (len(data) % TDX_RECORD_SIZE)
+    for raw_date, open_, high, low, close, amount, volume, _reserved in struct.iter_unpack(
+        "<IIIIIfII", data[:usable_size]
+    ):
+        if start_raw is not None and raw_date < start_raw:
             continue
-        raw_date, open_, high, low, close, amount, volume, _reserved = struct.unpack("<IIIIIfII", chunk)
+        if end_raw is not None and raw_date > end_raw:
+            continue
         rows.append(
             {
-                "date": pd.to_datetime(str(raw_date)),
+                "date": raw_date,
                 "open": open_ / 100.0,
                 "high": high / 100.0,
                 "low": low / 100.0,
@@ -65,10 +70,7 @@ def read_tdx_day_file(
     df = pd.DataFrame(rows)
     if df.empty:
         return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
-    if start_date:
-        df = df[df["date"] >= pd.to_datetime(start_date)]
-    if end_date:
-        df = df[df["date"] <= pd.to_datetime(end_date)]
+    df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
     return df[["date", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
 

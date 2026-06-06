@@ -14,6 +14,8 @@ from kline_model_research import (
     backtest_signals,
     find_consolidation_breakouts,
     find_breakout_pullback_restarts,
+    find_jianghua_acceleration_retests,
+    find_stage_high_breakout_retests,
     find_signals_for_model,
     find_trend_pullback_restarts,
     find_uptrend_bullish_engulfing,
@@ -214,6 +216,148 @@ class KlineModelResearchTests(unittest.TestCase):
         self.assertEqual(pd.Timestamp("2025-02-21"), signals[0].signal_date)
         self.assertAlmostEqual(16.6, signals[0].trigger_price)
         self.assertAlmostEqual(14.4, signals[0].initial_stop)
+
+    def test_stage_high_breakout_retest_detects_pullback_holding_prior_high(self):
+        rows = []
+        for index in range(60):
+            close = 10.0 + index * 0.03
+            rows.append(bar(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index), close, close + 0.2, close - 0.2, close))
+        rows.extend(
+            [
+                bar("2025-03-03", 12.1, 12.8, 12.0, 12.7),
+                bar("2025-03-04", 12.6, 12.7, 12.25, 12.4),
+                bar("2025-03-05", 12.4, 12.5, 12.15, 12.3),
+            ]
+        )
+
+        signals = find_stage_high_breakout_retests(
+            pd.DataFrame(rows),
+            lookback_bars=40,
+            min_base_bars=20,
+            max_retest_bars=5,
+            breakout_buffer=0.005,
+            support_tolerance=0.015,
+            min_pullback_pct=0.03,
+            max_extension_pct=0.08,
+            ma_fast=5,
+            ma_slow=20,
+        )
+
+        self.assertEqual(1, len(signals))
+        self.assertEqual("stage_high_breakout_retest", signals[0].model)
+        self.assertEqual(pd.Timestamp("2025-03-04"), signals[0].signal_date)
+        self.assertAlmostEqual(12.4, signals[0].trigger_price)
+        self.assertAlmostEqual(signals[0].metadata["prior_high"] * 0.985, signals[0].initial_stop)
+        self.assertGreaterEqual(signals[0].metadata["pullback_low"], signals[0].metadata["prior_high"] * 0.985)
+
+    def test_stage_high_breakout_retest_rejects_pullback_breaking_prior_high(self):
+        rows = []
+        for index in range(60):
+            close = 10.0 + index * 0.03
+            rows.append(bar(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index), close, close + 0.2, close - 0.2, close))
+        rows.extend(
+            [
+                bar("2025-03-03", 12.1, 12.8, 12.0, 12.7),
+                bar("2025-03-04", 12.6, 12.7, 11.75, 12.1),
+            ]
+        )
+
+        signals = find_stage_high_breakout_retests(
+            pd.DataFrame(rows),
+            lookback_bars=40,
+            min_base_bars=20,
+            max_retest_bars=5,
+            breakout_buffer=0.005,
+            support_tolerance=0.015,
+            min_pullback_pct=0.03,
+            max_extension_pct=0.08,
+            ma_fast=5,
+            ma_slow=20,
+        )
+
+        self.assertEqual([], signals)
+
+    def test_jianghua_acceleration_retest_requires_flagpole_then_volume_pullback(self):
+        rows = []
+        for index in range(60):
+            close = 10.0 + index * 0.03
+            rows.append(bar(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index), close, close + 0.1, close - 0.1, close, 1000))
+        rows.extend(
+            [
+                bar("2025-03-03", 12.10, 12.40, 12.00, 12.35, 1800),
+                bar("2025-03-04", 12.40, 15.50, 12.30, 15.00, 2400),
+                bar("2025-03-05", 14.80, 15.20, 13.90, 14.30, 1500),
+                bar("2025-03-06", 14.10, 14.40, 13.00, 13.40, 1300),
+                bar("2025-03-07", 13.00, 13.40, 12.60, 12.75, 1200),
+            ]
+        )
+
+        signals = find_jianghua_acceleration_retests(
+            pd.DataFrame(rows),
+            structure_lookback_bars=40,
+            min_base_bars=20,
+            max_peak_bars=5,
+            max_retest_bars=8,
+            breakout_buffer=0.005,
+            support_tolerance=0.02,
+            min_flagpole_pct=0.15,
+            max_flagpole_pct=0.45,
+            min_peak_drawdown_pct=0.10,
+            max_peak_drawdown_pct=0.28,
+            min_close_above_support_pct=0.02,
+            max_close_above_support_pct=0.09,
+            min_breakout_volume_ratio=1.5,
+            max_pullback_volume_ratio=0.8,
+            ma_fast=5,
+            ma_slow=20,
+            first_retest_only=False,
+        )
+
+        self.assertEqual(1, len(signals))
+        signal = signals[-1]
+        self.assertEqual("jianghua_acceleration_retest", signal.model)
+        self.assertEqual(pd.Timestamp("2025-03-07"), signal.signal_date)
+        self.assertAlmostEqual(12.75, signal.trigger_price)
+        self.assertGreater(signal.metadata["flagpole_pct"], 0.15)
+        self.assertGreater(signal.metadata["peak_drawdown_pct"], 0.10)
+        self.assertLess(signal.metadata["pullback_volume_ratio"], 0.8)
+        self.assertGreater(signal.metadata["similarity_score"], 0)
+
+    def test_jianghua_acceleration_retest_rejects_small_breakout_without_flagpole(self):
+        rows = []
+        for index in range(60):
+            close = 10.0 + index * 0.03
+            rows.append(bar(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index), close, close + 0.1, close - 0.1, close, 1000))
+        rows.extend(
+            [
+                bar("2025-03-03", 12.10, 12.40, 12.00, 12.35, 1800),
+                bar("2025-03-04", 12.40, 13.00, 12.30, 12.80, 1600),
+                bar("2025-03-05", 12.70, 12.90, 12.30, 12.55, 1200),
+            ]
+        )
+
+        signals = find_jianghua_acceleration_retests(
+            pd.DataFrame(rows),
+            structure_lookback_bars=40,
+            min_base_bars=20,
+            max_peak_bars=5,
+            max_retest_bars=8,
+            breakout_buffer=0.005,
+            support_tolerance=0.02,
+            min_flagpole_pct=0.15,
+            max_flagpole_pct=0.45,
+            min_peak_drawdown_pct=0.10,
+            max_peak_drawdown_pct=0.28,
+            min_close_above_support_pct=0.02,
+            max_close_above_support_pct=0.09,
+            min_breakout_volume_ratio=1.5,
+            max_pullback_volume_ratio=0.8,
+            ma_fast=5,
+            ma_slow=20,
+            first_retest_only=False,
+        )
+
+        self.assertEqual([], signals)
 
     def test_summarize_trades_reports_expectancy_and_distribution(self):
         trades = [

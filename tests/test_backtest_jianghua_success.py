@@ -7,8 +7,10 @@ import pandas as pd
 from backtest_jianghua_success import (
     attach_turnover_rate_from_float_share,
     build_market_context_from_frames,
+    classify_market_regime,
     evaluate_signal,
     find_jianghua_acceleration_retests_fast,
+    load_structural_code_pool,
     market_context_passes_filter,
 )
 from kline_model_research import PatternSignal, find_jianghua_acceleration_retests
@@ -213,13 +215,13 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
             "000001": pd.DataFrame(
                 [
                     bar(str(pd.Timestamp("2026-01-01") + pd.Timedelta(days=index)), 10 + index, 10 + index, 10 + index, 10 + index)
-                    for index in range(65)
+                    for index in range(130)
                 ]
             ),
             "000002": pd.DataFrame(
                 [
                     bar(str(pd.Timestamp("2026-01-01") + pd.Timedelta(days=index)), 20 - index * 0.1, 20 - index * 0.1, 20 - index * 0.1, 20 - index * 0.1)
-                    for index in range(65)
+                    for index in range(130)
                 ]
             ),
         }
@@ -230,8 +232,54 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         self.assertEqual(2, latest["stock_count"])
         self.assertAlmostEqual(0.5, latest["advance_rate"])
         self.assertAlmostEqual(0.5, latest["above_ma20_rate"])
+        self.assertGreater(latest["ret120_p95"], latest["ret120_median"])
         self.assertTrue(market_context_passes_filter(latest, 0.45, 0.45, 0.0))
-        self.assertFalse(market_context_passes_filter(latest, 0.60, 0.45, 0.0))
+        self.assertFalse(market_context_passes_filter(latest, 0.60, 0.45, 0.0, allow_structural_bull=False))
+
+    def test_market_regime_allows_structural_bull_when_breadth_is_weak_but_leaders_are_strong(self) -> None:
+        context = {
+            "advance_rate": 0.35,
+            "above_ma20_rate": 0.20,
+            "above_ma60_rate": 0.25,
+            "ret120_median": -0.08,
+            "ret120_p95": 0.55,
+        }
+
+        self.assertEqual("structural_bull", classify_market_regime(context, 0.45, 0.35, 0.0, True, 0.30, 0.35))
+        self.assertFalse(market_context_passes_filter(context, 0.45, 0.35, 0.0, code="000001"))
+        self.assertTrue(
+            market_context_passes_filter(
+                context,
+                0.45,
+                0.35,
+                0.0,
+                code="000001",
+                structural_code_pool={"000001"},
+            )
+        )
+
+    def test_market_regime_rejects_weak_market_without_broad_or_structural_strength(self) -> None:
+        context = {
+            "advance_rate": 0.35,
+            "above_ma20_rate": 0.20,
+            "above_ma60_rate": 0.25,
+            "ret120_median": -0.08,
+            "ret120_p95": 0.12,
+        }
+
+        self.assertEqual("weak_or_no_trend", classify_market_regime(context, 0.45, 0.35, 0.0, True, 0.30, 0.35))
+        self.assertFalse(market_context_passes_filter(context, 0.45, 0.35, 0.0))
+
+    def test_load_structural_code_pool_reads_code_column(self) -> None:
+        path = "data/cache/test_structural_pool.csv"
+        pd.DataFrame(
+            [
+                {"code": "300750", "board_name": "AI"},
+                {"code": 688256, "board_name": "算力"},
+            ]
+        ).to_csv(path, index=False)
+
+        self.assertEqual({"300750", "688256"}, load_structural_code_pool(path))
 
     def test_evaluate_signal_marks_success_when_30pct_high_is_reached_within_20_bars(self) -> None:
         rows = [bar("2026-01-02", 10.0, 10.2, 9.8, 10.0)]

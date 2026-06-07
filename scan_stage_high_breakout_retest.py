@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import StringIO
 from pathlib import Path
+import re
 
 import akshare as ak
 import pandas as pd
+import requests
 
+from daily_sector_report import Board, fetch_board_cons, fetch_boards, fetch_top_fund_flow_boards, ths_headers
 from darvas_weekly_backtest import fetch_daily_history_akshare_tx, normalize_daily_columns
 from kline_model_research import (
     find_jianghua_acceleration_retests,
@@ -17,9 +21,11 @@ from tdx_data import read_tdx_daily_bars
 from backtest_jianghua_success import (
     _market_context_lookup,
     attach_turnover_rate_from_float_share,
+    classify_market_regime,
     find_jianghua_acceleration_retests_fast,
     load_float_share_by_code,
     load_or_build_market_context,
+    load_structural_code_pool,
     market_context_passes_filter,
 )
 
@@ -50,13 +56,19 @@ CANDIDATE_COLUMNS = [
     "ma_fast",
     "ma_slow",
     "market_advance_rate",
+    "market_regime",
+    "in_structural_code_pool",
     "market_above_ma20_rate",
     "market_above_ma60_rate",
     "market_new_high_60_rate",
+    "market_ret120_median",
+    "market_ret120_p95",
+    "market_ret120_spread_p95_median",
     "data_source",
     "note",
 ]
 FAILURE_COLUMNS = ["code", "name", "reason"]
+STRUCTURAL_POOL_COLUMNS = ["code", "name", "board_name", "board_rank", "pool_source"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -102,6 +114,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-market-above-ma20-rate", type=float, default=0.45)
     parser.add_argument("--min-market-above-ma60-rate", type=float, default=0.35)
     parser.add_argument("--min-market-advance-rate", type=float, default=0.0)
+    parser.add_argument("--allow-structural-bull", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--min-structural-ret120-p95", type=float, default=0.30)
+    parser.add_argument("--min-structural-return-spread", type=float, default=0.35)
+    parser.add_argument("--structural-code-pool-file", default=None)
+    parser.add_argument("--structural-code-pool-cache", default=None)
+    parser.add_argument("--structural-pool-mode", choices=["long_term", "current"], default="long_term")
+    parser.add_argument("--structural-concept-top-n", type=int, default=10)
+    parser.add_argument("--structural-concept-lookback-days", type=int, default=540)
+    parser.add_argument("--min-structural-concept-ret120", type=float, default=0.20)
+    parser.add_argument("--min-structural-concept-ret250", type=float, default=0.50)
+    parser.add_argument(
+        "--structural-theme-keywords",
+        default="AI,算力,CPO,光模块,机器人,半导体,芯片,6G,数据中心,东数西算,云计算,软件,信创,低空,无人机,卫星,军工信息化,新型工业化,存储,PCB,消费电子",
+    )
     parser.add_argument("--float-share-cache", default=None)
     parser.add_argument("--float-share-provider", choices=["auto", "tdx", "tushare", "eastmoney"], default="auto")
     parser.add_argument("--tdx-base-dbf", default=r"C:\new_tdx\T0002\hq_cache\base.dbf")
@@ -129,6 +155,7 @@ def run(args: argparse.Namespace) -> list[Path]:
         args.signal_end_date = args.end_date
         args.history_start_date = args.start_date
         args.float_share_by_code = load_float_share_by_code(args)
+        args.structural_code_pool = load_or_build_structural_code_pool(args)
         args.market_context_by_date = {}
         if not args.disable_market_filter:
             args.market_context_by_date = _market_context_lookup(load_or_build_market_context(items, args))
@@ -159,6 +186,414 @@ def run(args: argparse.Namespace) -> list[Path]:
     pd.DataFrame(failures, columns=FAILURE_COLUMNS).to_csv(failures_path, index=False, encoding="utf-8-sig")
     print(f"DONE total={len(items)} candidates={len(rows)} failures={len(failures)}", flush=True)
     return [candidates_path, failures_path]
+
+
+def load_or_build_structural_code_pool(args: argparse.Namespace) -> set[str]:
+    if args.structural_code_pool_file:
+        return load_structural_code_pool(args.structural_code_pool_file)
+    if not args.allow_structural_bull:
+        return set()
+
+    cache_path = Path(
+        args.structural_code_pool_cache
+        or f"data/cache/concept_strength/structural_code_pool_{args.structural_pool_mode}_{args.end_date}.csv"
+    )
+    if cache_path.exists():
+        return load_structural_code_pool(cache_path)
+
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.structural_pool_mode == "long_term":
+        pool = build_long_term_structural_concept_pool(
+            end_date=args.end_date,
+            tdx_vipdoc=args.tdx_vipdoc,
+            lookback_days=args.structural_concept_lookback_days,
+            top_n=args.structural_concept_top_n,
+            min_ret120=args.min_structural_concept_ret120,
+            min_ret250=args.min_structural_concept_ret250,
+            theme_keywords=parse_theme_keywords(args.structural_theme_keywords),
+        )
+        if pool.empty:
+            print("long_term_structural_pool_empty fallback=current", flush=True)
+            pool = build_structural_concept_pool(args.structural_concept_top_n)
+    else:
+        pool = build_structural_concept_pool(args.structural_concept_top_n)
+    pool.to_csv(cache_path, index=False, encoding="utf-8-sig")
+    print(f"structural_code_pool_cached rows={len(pool)} path={cache_path}", flush=True)
+    return load_structural_code_pool(cache_path)
+
+
+def build_structural_concept_pool(top_n: int) -> pd.DataFrame:
+    boards = select_structural_concept_boards(top_n)
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for rank, board in enumerate(boards, start=1):
+        try:
+            constituents = fetch_board_cons(board)
+        except Exception as exc:
+            print(f"structural_board_cons_failed board={board.name} reason={str(exc)[:160]}", flush=True)
+            continue
+        for code, name in extract_constituent_codes(constituents):
+            key = (code, board.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board_name": board.name,
+                    "board_rank": rank,
+                    "pool_source": board.raw.get("_ranking_provider", board.raw.get("_provider", "unknown")),
+                }
+            )
+    return pd.DataFrame(rows, columns=STRUCTURAL_POOL_COLUMNS)
+
+
+def build_long_term_structural_concept_pool(
+    end_date: str,
+    tdx_vipdoc: str,
+    lookback_days: int,
+    top_n: int,
+    min_ret120: float,
+    min_ret250: float,
+    theme_keywords: list[str],
+) -> pd.DataFrame:
+    histories = fetch_concept_histories(end_date, lookback_days)
+    boards = select_long_term_concept_boards(histories, top_n, min_ret120, min_ret250)
+    if not boards:
+        return build_constituent_return_structural_concept_pool(
+            end_date=end_date,
+            tdx_vipdoc=tdx_vipdoc,
+            lookback_days=lookback_days,
+            top_n=top_n,
+            min_ret120=min_ret120,
+            min_ret250=min_ret250,
+            theme_keywords=theme_keywords,
+        )
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for rank, board in enumerate(boards, start=1):
+        try:
+            constituents = ak.stock_board_concept_cons_em(symbol=board.name)
+        except Exception as exc:
+            print(f"long_term_board_cons_failed board={board.name} reason={str(exc)[:160]}", flush=True)
+            continue
+        for code, name in extract_constituent_codes(constituents):
+            key = (code, board.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board_name": board.name,
+                    "board_rank": rank,
+                    "pool_source": "long_term_concept_strength",
+                }
+            )
+    return pd.DataFrame(rows, columns=STRUCTURAL_POOL_COLUMNS)
+
+
+def build_constituent_return_structural_concept_pool(
+    end_date: str,
+    tdx_vipdoc: str,
+    lookback_days: int,
+    top_n: int,
+    min_ret120: float,
+    min_ret250: float,
+    theme_keywords: list[str],
+) -> pd.DataFrame:
+    boards = load_theme_concept_boards(theme_keywords)
+    board_constituents: dict[str, pd.DataFrame] = {}
+    for board in boards:
+        try:
+            board_constituents[board.name] = fetch_ths_concept_constituents(str(board.raw["board_code"]), board.name)
+        except Exception as exc:
+            print(f"theme_board_cons_failed board={board.name} reason={str(exc)[:160]}", flush=True)
+
+    start_date = (pd.Timestamp(end_date) - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+    stock_returns: dict[str, dict[str, float]] = {}
+    for constituents in board_constituents.values():
+        for code, _name in extract_constituent_codes(constituents):
+            if code in stock_returns:
+                continue
+            stock_returns[code] = read_stock_return_features(tdx_vipdoc, code, start_date, end_date)
+
+    strength = build_constituent_return_concept_strength(board_constituents, stock_returns)
+    selected = strength[(strength["ret120_median"] >= min_ret120) & (strength["ret250_median"] >= min_ret250)].head(top_n)
+    rows: list[dict[str, object]] = []
+    seen: set[tuple[str, str]] = set()
+    for rank, board_name in enumerate(selected["board_name"].astype(str), start=1):
+        constituents = board_constituents.get(board_name, pd.DataFrame())
+        for code, name in extract_constituent_codes(constituents):
+            key = (code, board_name)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "board_name": board_name,
+                    "board_rank": rank,
+                    "pool_source": "constituent_return_strength",
+                }
+            )
+    return pd.DataFrame(rows, columns=STRUCTURAL_POOL_COLUMNS)
+
+
+def fetch_concept_histories(end_date: str, lookback_days: int) -> dict[str, pd.DataFrame]:
+    end_ts = pd.Timestamp(end_date)
+    start_date = (end_ts - pd.Timedelta(days=lookback_days)).strftime("%Y%m%d")
+    end_raw = end_ts.strftime("%Y%m%d")
+    names = load_em_concept_names_for_history()
+
+    histories: dict[str, pd.DataFrame] = {}
+    for name in names:
+        try:
+            hist = ak.stock_board_concept_hist_em(symbol=name, start_date=start_date, end_date=end_raw, period="日k", adjust="")
+            histories[name] = normalize_concept_history(hist)
+        except Exception as exc:
+            print(f"concept_hist_failed board={name} reason={str(exc)[:120]}", flush=True)
+    return histories
+
+
+def load_em_concept_names_for_history() -> list[str]:
+    try:
+        em_names = ak.stock_board_concept_name_em()
+        names = [str(row.get("板块名称", row.get("name", ""))).strip() for _, row in em_names.iterrows()]
+        return [name for name in names if name]
+    except Exception as exc:
+        print(f"concept_name_em_failed reason={str(exc)[:160]}", flush=True)
+        return []
+
+def normalize_concept_history(hist: pd.DataFrame) -> pd.DataFrame:
+    if hist.empty:
+        return pd.DataFrame(columns=["date", "close"])
+    date_col = next((column for column in ["日期", "date"] if column in hist.columns), hist.columns[0])
+    close_col = next((column for column in ["收盘", "close"] if column in hist.columns), None)
+    if close_col is None:
+        numeric_cols = [column for column in hist.columns if pd.api.types.is_numeric_dtype(hist[column])]
+        if not numeric_cols:
+            return pd.DataFrame(columns=["date", "close"])
+        close_col = numeric_cols[-1]
+    output = pd.DataFrame(
+        {
+            "date": pd.to_datetime(hist[date_col]),
+            "close": pd.to_numeric(hist[close_col], errors="coerce"),
+        }
+    ).dropna(subset=["date", "close"])
+    return output.sort_values("date").reset_index(drop=True)
+
+
+def build_long_term_concept_strength(histories: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for name, hist in histories.items():
+        history = normalize_concept_history(hist)
+        if len(history) < 121:
+            continue
+        close = pd.to_numeric(history["close"], errors="coerce").dropna().reset_index(drop=True)
+        if len(close) < 121 or close.iloc[-1] <= 0:
+            continue
+        ret20 = _window_return(close, 20)
+        ret60 = _window_return(close, 60)
+        ret120 = _window_return(close, 120)
+        ret250 = _window_return(close, 250)
+        ma20 = float(close.tail(20).mean())
+        ma60 = float(close.tail(60).mean()) if len(close) >= 60 else ma20
+        trend_score = (1 if close.iloc[-1] > ma20 else 0) + (1 if ma20 > ma60 else 0) + max(0.0, min(ret20, 0.50))
+        long_term_score = ret120 * 0.35 + ret250 * 0.45 + ret60 * 0.15 + trend_score * 0.05
+        rows.append(
+            {
+                "board_name": name,
+                "ret20": ret20,
+                "ret60": ret60,
+                "ret120": ret120,
+                "ret250": ret250,
+                "trend_score": trend_score,
+                "long_term_score": long_term_score,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=["board_name", "ret20", "ret60", "ret120", "ret250", "trend_score", "long_term_score"])
+    return pd.DataFrame(rows).sort_values(["long_term_score", "ret250", "ret120"], ascending=False).reset_index(drop=True)
+
+
+def select_long_term_concept_boards(
+    histories: dict[str, pd.DataFrame],
+    top_n: int,
+    min_ret120: float,
+    min_ret250: float,
+) -> list[Board]:
+    strength = build_long_term_concept_strength(histories)
+    if strength.empty:
+        return []
+    filtered = strength[(strength["ret120"] >= min_ret120) & (strength["ret250"] >= min_ret250)].head(top_n)
+    boards: list[Board] = []
+    for _, row in filtered.iterrows():
+        raw = row.to_dict()
+        raw["_ranking_provider"] = "long_term_concept_strength"
+        boards.append(Board(str(row["board_name"]), "concept", float(row["ret20"]) * 100, raw))
+    return boards
+
+
+def parse_theme_keywords(raw: str | list[str]) -> list[str]:
+    if isinstance(raw, list):
+        return [item.strip() for item in raw if str(item).strip()]
+    return [item.strip() for item in re.split(r"[,，;；\s]+", str(raw)) if item.strip()]
+
+
+def load_theme_concept_boards(theme_keywords: list[str]) -> list[Board]:
+    if not theme_keywords:
+        return []
+    try:
+        names = ak.stock_board_concept_name_ths()
+    except Exception as exc:
+        print(f"theme_concept_name_failed reason={str(exc)[:160]}", flush=True)
+        return []
+    boards: list[Board] = []
+    for _, row in names.iterrows():
+        name = str(row.get("name", "")).strip()
+        code = str(row.get("code", "")).strip()
+        if not name or not code:
+            continue
+        if any(keyword.lower() in name.lower() for keyword in theme_keywords):
+            boards.append(Board(name, "concept", 0.0, {"board_code": code, "_provider": "ths_theme"}))
+    return boards
+
+
+def fetch_ths_concept_constituents(board_code: str, board_name: str) -> pd.DataFrame:
+    url = f"http://q.10jqka.com.cn/gn/detail/code/{board_code}/"
+    response = requests.get(url, headers=ths_headers(), timeout=20)
+    response.raise_for_status()
+    response.encoding = response.apparent_encoding
+    try:
+        return pd.read_html(StringIO(response.text))[0]
+    except ValueError as exc:
+        raise RuntimeError(f"THS concept constituents parse failed: {board_name}") from exc
+
+
+def read_stock_return_features(tdx_vipdoc: str, code: str, start_date: str, end_date: str) -> dict[str, float]:
+    try:
+        bars = normalize_price_bars(read_tdx_daily_bars(tdx_vipdoc, code, start_date, end_date))
+    except Exception:
+        return {"ret120": float("nan"), "ret250": float("nan"), "ret60": float("nan")}
+    if bars.empty:
+        return {"ret120": float("nan"), "ret250": float("nan"), "ret60": float("nan")}
+    close = pd.to_numeric(bars["close"], errors="coerce").dropna().reset_index(drop=True)
+    return {
+        "ret60": _window_return(close, 60),
+        "ret120": _window_return(close, 120),
+        "ret250": _window_return(close, 250),
+    }
+
+
+def build_constituent_return_concept_strength(
+    board_constituents: dict[str, pd.DataFrame],
+    stock_returns: dict[str, dict[str, float]],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for board_name, constituents in board_constituents.items():
+        codes = [code for code, _name in extract_constituent_codes(constituents)]
+        features = [stock_returns.get(code, {}) for code in codes]
+        frame = pd.DataFrame(features)
+        if frame.empty or "ret120" not in frame or "ret250" not in frame:
+            continue
+        frame = frame.apply(pd.to_numeric, errors="coerce")
+        valid = frame.dropna(subset=["ret120", "ret250"])
+        if len(valid) < 3:
+            continue
+        ret120_median = float(valid["ret120"].median())
+        ret250_median = float(valid["ret250"].median())
+        ret120_p75 = float(valid["ret120"].quantile(0.75))
+        ret250_p75 = float(valid["ret250"].quantile(0.75))
+        breadth120 = float((valid["ret120"] > 0).mean())
+        score = ret250_median * 0.40 + ret120_median * 0.35 + ret250_p75 * 0.15 + breadth120 * 0.10
+        rows.append(
+            {
+                "board_name": board_name,
+                "member_count": len(valid),
+                "ret120_median": ret120_median,
+                "ret250_median": ret250_median,
+                "ret120_p75": ret120_p75,
+                "ret250_p75": ret250_p75,
+                "breadth120": breadth120,
+                "long_term_score": score,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(
+            columns=[
+                "board_name",
+                "member_count",
+                "ret120_median",
+                "ret250_median",
+                "ret120_p75",
+                "ret250_p75",
+                "breadth120",
+                "long_term_score",
+            ]
+        )
+    return pd.DataFrame(rows).sort_values(["long_term_score", "ret250_median", "ret120_median"], ascending=False).reset_index(drop=True)
+
+
+def _window_return(close: pd.Series, bars: int) -> float:
+    if len(close) <= bars or close.iloc[-bars - 1] <= 0:
+        return float("nan")
+    return float(close.iloc[-1] / close.iloc[-bars - 1] - 1)
+
+
+def select_structural_concept_boards(top_n: int) -> list[Board]:
+    selected: list[Board] = []
+    seen_names: set[str] = set()
+    sources = [
+        ("fund_flow", lambda: fetch_top_fund_flow_boards(top_n)),
+        ("ths_pct", lambda: fetch_boards("concept", "ths")[:top_n]),
+    ]
+    for source_name, loader in sources:
+        try:
+            boards = loader()
+        except Exception as exc:
+            print(f"structural_boards_failed source={source_name} reason={str(exc)[:160]}", flush=True)
+            continue
+        for board in boards:
+            if board.name in seen_names:
+                continue
+            seen_names.add(board.name)
+            raw = dict(board.raw)
+            raw["_ranking_provider"] = raw.get("_ranking_provider", source_name)
+            selected.append(Board(board.name, board.source, board.pct_chg, raw, board.metric_value, board.metric_label))
+    return selected
+
+
+def extract_constituent_codes(df: pd.DataFrame) -> list[tuple[str, str]]:
+    if df.empty:
+        return []
+    rows: list[tuple[str, str]] = []
+    for _, row in df.iterrows():
+        code = ""
+        for value in row.tolist():
+            match = re.search(r"(?<!\d)(\d{6})(?!\d)", str(value))
+            if match:
+                code = match.group(1)
+                break
+        if not code:
+            continue
+        name = _extract_name_from_row(row, code)
+        rows.append((code, name))
+    return rows
+
+
+def _extract_name_from_row(row: pd.Series, code: str) -> str:
+    for value in row.tolist():
+        if pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text != code and not re.fullmatch(r"[-+]?\d+(\.\d+)?%?", text):
+            if not re.search(r"\d{6}", text):
+                return text
+    return ""
 
 
 def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object] | None:
@@ -219,13 +654,29 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
     market_context = None
     if args.model == "jianghua_acceleration_retest":
         market_context = args.market_context_by_date.get(pd.Timestamp(signal.signal_date).strftime("%Y-%m-%d"))
+        market_regime = classify_market_regime(
+            market_context,
+            args.min_market_above_ma20_rate,
+            args.min_market_above_ma60_rate,
+            args.min_market_advance_rate,
+            args.allow_structural_bull,
+            args.min_structural_ret120_p95,
+            args.min_structural_return_spread,
+        )
         if not args.disable_market_filter and not market_context_passes_filter(
             market_context,
             args.min_market_above_ma20_rate,
             args.min_market_above_ma60_rate,
             args.min_market_advance_rate,
+            args.allow_structural_bull,
+            args.min_structural_ret120_p95,
+            args.min_structural_return_spread,
+            code=code,
+            structural_code_pool=args.structural_code_pool,
         ):
             return None
+    else:
+        market_regime = ""
 
     metadata = signal.metadata
     breakout_index = int(metadata["breakout_index"])
@@ -261,9 +712,17 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
         "ma_fast": round(float(metadata["ma_fast"]), 3),
         "ma_slow": round(float(metadata["ma_slow"]), 3),
         "market_advance_rate": round(float((market_context or {}).get("advance_rate", 0.0)), 4),
+        "market_regime": market_regime,
+        "in_structural_code_pool": str(code).zfill(6) in getattr(args, "structural_code_pool", set()),
         "market_above_ma20_rate": round(float((market_context or {}).get("above_ma20_rate", 0.0)), 4),
         "market_above_ma60_rate": round(float((market_context or {}).get("above_ma60_rate", 0.0)), 4),
         "market_new_high_60_rate": round(float((market_context or {}).get("new_high_60_rate", 0.0)), 4),
+        "market_ret120_median": round(float((market_context or {}).get("ret120_median", 0.0)), 4),
+        "market_ret120_p95": round(float((market_context or {}).get("ret120_p95", 0.0)), 4),
+        "market_ret120_spread_p95_median": round(
+            float((market_context or {}).get("ret120_spread_p95_median", 0.0)),
+            4,
+        ),
         "data_source": daily.attrs.get("data_source", "unknown"),
         "note": f"{args.model}_daily; watchlist_only",
     }

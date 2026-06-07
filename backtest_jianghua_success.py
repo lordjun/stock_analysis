@@ -58,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-market-above-ma20-rate", type=float, default=0.45)
     parser.add_argument("--min-market-above-ma60-rate", type=float, default=0.35)
     parser.add_argument("--min-market-advance-rate", type=float, default=0.0)
+    parser.add_argument("--allow-structural-bull", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--min-structural-ret120-p95", type=float, default=0.30)
+    parser.add_argument("--min-structural-return-spread", type=float, default=0.35)
+    parser.add_argument("--structural-code-pool-file", default=None)
     parser.add_argument("--float-share-cache", default=None)
     parser.add_argument("--float-share-provider", choices=["auto", "tdx", "tushare", "eastmoney"], default="auto")
     parser.add_argument("--tdx-base-dbf", default=r"C:\new_tdx\T0002\hq_cache\base.dbf")
@@ -80,6 +84,7 @@ def run(args: argparse.Namespace) -> list[Path]:
     universe = fetch_current_non_st_universe(args.limit)
     items = [(str(row.code).zfill(6), str(row.name)) for row in universe.itertuples(index=False)]
     args.float_share_by_code = load_float_share_by_code(args)
+    args.structural_code_pool = load_structural_code_pool(args.structural_code_pool_file)
     args.market_context_by_date = {}
     if not args.disable_market_filter:
         market_context = load_or_build_market_context(items, args)
@@ -283,6 +288,22 @@ def attach_turnover_rate_from_float_share(
     return output
 
 
+def load_structural_code_pool(path: str | Path | None) -> set[str]:
+    if not path:
+        return set()
+    pool_path = Path(path)
+    if not pool_path.exists():
+        raise FileNotFoundError(str(pool_path))
+    raw = pd.read_csv(pool_path, dtype=str)
+    if raw.empty:
+        return set()
+    code_column = next((column for column in ["code", "ts_code", "stock_code", "证券代码", "股票代码"] if column in raw.columns), None)
+    if code_column is None:
+        raise RuntimeError(f"structural code pool missing code column: {pool_path}")
+    codes = raw[code_column].astype(str).str.extract(r"(\d{6})", expand=False).dropna()
+    return {str(code).zfill(6) for code in codes}
+
+
 def load_or_build_market_context(items: list[tuple[str, str]], args: argparse.Namespace) -> pd.DataFrame:
     universe_tag = f"limit{args.limit}" if args.limit else "all"
     cache_path = Path(
@@ -290,7 +311,10 @@ def load_or_build_market_context(items: list[tuple[str, str]], args: argparse.Na
         or f"data/cache/market_context/tdx_breadth_{universe_tag}_{args.history_start_date}_{args.signal_end_date}.csv"
     )
     if cache_path.exists():
-        return pd.read_csv(cache_path, dtype={"date": str})
+        cached = pd.read_csv(cache_path, dtype={"date": str})
+        if _market_context_has_required_columns(cached):
+            return cached
+        print(f"market_context_cache_stale path={cache_path}; rebuild=missing_structural_columns", flush=True)
 
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     frames: dict[str, pd.DataFrame] = {}
@@ -331,6 +355,7 @@ def build_market_context_from_frames(frames: dict[str, pd.DataFrame]) -> pd.Data
                 "above_ma20": close.gt(close.rolling(20).mean()).astype("int8"),
                 "above_ma60": close.gt(close.rolling(60).mean()).astype("int8"),
                 "new_high_60": close.ge(close.rolling(60).max()).astype("int8"),
+                "ret120": close / close.shift(120) - 1,
                 "valid": close.rolling(60).mean().notna().astype("int8"),
             }
         )
@@ -339,7 +364,17 @@ def build_market_context_from_frames(frames: dict[str, pd.DataFrame]) -> pd.Data
             component_frames.append(work)
     if not component_frames:
         return pd.DataFrame(
-            columns=["date", "stock_count", "advance_rate", "above_ma20_rate", "above_ma60_rate", "new_high_60_rate"]
+            columns=[
+                "date",
+                "stock_count",
+                "advance_rate",
+                "above_ma20_rate",
+                "above_ma60_rate",
+                "new_high_60_rate",
+                "ret120_median",
+                "ret120_p95",
+                "ret120_spread_p95_median",
+            ]
         )
 
     components = pd.concat(component_frames, ignore_index=True)
@@ -355,8 +390,28 @@ def build_market_context_from_frames(frames: dict[str, pd.DataFrame]) -> pd.Data
     context["above_ma20_rate"] = context["above_ma20"] / context["stock_count"]
     context["above_ma60_rate"] = context["above_ma60"] / context["stock_count"]
     context["new_high_60_rate"] = context["new_high_60"] / context["stock_count"]
+    ret120 = components.dropna(subset=["ret120"]).groupby("date", sort=True)["ret120"]
+    context = context.merge(
+        ret120.agg(
+            ret120_median="median",
+            ret120_p95=lambda series: float(series.quantile(0.95)),
+        ).reset_index(),
+        on="date",
+        how="left",
+    )
+    context["ret120_spread_p95_median"] = context["ret120_p95"] - context["ret120_median"]
     return context[
-        ["date", "stock_count", "advance_rate", "above_ma20_rate", "above_ma60_rate", "new_high_60_rate"]
+        [
+            "date",
+            "stock_count",
+            "advance_rate",
+            "above_ma20_rate",
+            "above_ma60_rate",
+            "new_high_60_rate",
+            "ret120_median",
+            "ret120_p95",
+            "ret120_spread_p95_median",
+        ]
     ].reset_index(drop=True)
 
 
@@ -365,14 +420,76 @@ def market_context_passes_filter(
     min_above_ma20_rate: float,
     min_above_ma60_rate: float,
     min_advance_rate: float,
+    allow_structural_bull: bool = True,
+    min_structural_ret120_p95: float = 0.30,
+    min_structural_return_spread: float = 0.35,
+    code: str | None = None,
+    structural_code_pool: set[str] | None = None,
 ) -> bool:
-    if not context:
+    regime = classify_market_regime(
+        context,
+        min_above_ma20_rate,
+        min_above_ma60_rate,
+        min_advance_rate,
+        allow_structural_bull,
+        min_structural_ret120_p95,
+        min_structural_return_spread,
+    )
+    if regime == "broad_bull":
+        return True
+    if regime != "structural_bull":
         return False
-    return (
+    if not code or not structural_code_pool:
+        return False
+    return str(code).zfill(6) in structural_code_pool
+
+
+def classify_market_regime(
+    context: dict[str, object] | None,
+    min_above_ma20_rate: float,
+    min_above_ma60_rate: float,
+    min_advance_rate: float,
+    allow_structural_bull: bool,
+    min_structural_ret120_p95: float,
+    min_structural_return_spread: float,
+) -> str:
+    if not context:
+        return "unknown"
+
+    broad_bull = (
         float(context.get("above_ma20_rate", 0.0)) >= min_above_ma20_rate
         and float(context.get("above_ma60_rate", 0.0)) >= min_above_ma60_rate
         and float(context.get("advance_rate", 0.0)) >= min_advance_rate
     )
+    if broad_bull:
+        return "broad_bull"
+
+    ret120_p95 = float(context.get("ret120_p95", float("nan")))
+    ret120_median = float(context.get("ret120_median", float("nan")))
+    spread = float(context.get("ret120_spread_p95_median", ret120_p95 - ret120_median))
+    structural_bull = (
+        allow_structural_bull
+        and pd.notna(ret120_p95)
+        and pd.notna(spread)
+        and ret120_p95 >= min_structural_ret120_p95
+        and spread >= min_structural_return_spread
+    )
+    return "structural_bull" if structural_bull else "weak_or_no_trend"
+
+
+def _market_context_has_required_columns(context: pd.DataFrame) -> bool:
+    required = {
+        "date",
+        "stock_count",
+        "advance_rate",
+        "above_ma20_rate",
+        "above_ma60_rate",
+        "new_high_60_rate",
+        "ret120_median",
+        "ret120_p95",
+        "ret120_spread_p95_median",
+    }
+    return required.issubset(context.columns)
 
 
 def _market_context_lookup(context: pd.DataFrame) -> dict[str, dict[str, object]]:
@@ -425,11 +542,25 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
         if signal.signal_index < next_allowed_signal_index:
             continue
         market_context = args.market_context_by_date.get(_fmt_date(signal_date))
+        market_regime = classify_market_regime(
+            market_context,
+            args.min_market_above_ma20_rate,
+            args.min_market_above_ma60_rate,
+            args.min_market_advance_rate,
+            args.allow_structural_bull,
+            args.min_structural_ret120_p95,
+            args.min_structural_return_spread,
+        )
         if not args.disable_market_filter and not market_context_passes_filter(
             market_context,
             args.min_market_above_ma20_rate,
             args.min_market_above_ma60_rate,
             args.min_market_advance_rate,
+            args.allow_structural_bull,
+            args.min_structural_ret120_p95,
+            args.min_structural_return_spread,
+            code=code,
+            structural_code_pool=args.structural_code_pool,
         ):
             continue
         row = evaluate_signal(code, name, bars, signal, args.target_return, args.success_bars, args.reversal_bars)
@@ -438,11 +569,19 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
         if market_context:
             row.update(
                 {
+                    "market_regime": market_regime,
+                    "in_structural_code_pool": str(code).zfill(6) in args.structural_code_pool,
                     "market_stock_count": int(market_context["stock_count"]),
                     "market_advance_rate": round(float(market_context["advance_rate"]), 4),
                     "market_above_ma20_rate": round(float(market_context["above_ma20_rate"]), 4),
                     "market_above_ma60_rate": round(float(market_context["above_ma60_rate"]), 4),
                     "market_new_high_60_rate": round(float(market_context["new_high_60_rate"]), 4),
+                    "market_ret120_median": round(float(market_context.get("ret120_median", 0.0)), 4),
+                    "market_ret120_p95": round(float(market_context.get("ret120_p95", 0.0)), 4),
+                    "market_ret120_spread_p95_median": round(
+                        float(market_context.get("ret120_spread_p95_median", 0.0)),
+                        4,
+                    ),
                 }
             )
         rows.append(row)
@@ -732,6 +871,19 @@ def build_similarity_summary(trades: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
 
+def build_market_regime_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    columns = ["market_regime", "trades", "successes", "success_rate_pct", "median_max_return_20d_pct"]
+    if trades.empty or "market_regime" not in trades.columns:
+        return pd.DataFrame(columns=columns)
+    grouped = trades.groupby("market_regime", dropna=False)
+    return grouped.agg(
+        trades=("code", "count"),
+        successes=("success_20d_30pct", "sum"),
+        success_rate_pct=("success_20d_30pct", lambda series: round(float(series.mean()) * 100, 2) if len(series) else 0.0),
+        median_max_return_20d_pct=("max_return_20d_pct", "median"),
+    ).reset_index()
+
+
 def build_summary_markdown(trades: pd.DataFrame, failures: pd.DataFrame, args: argparse.Namespace, stock_count: int) -> str:
     lines = [
         "# Jianghua acceleration retest success backtest",
@@ -744,7 +896,7 @@ def build_summary_markdown(trades: pd.DataFrame, failures: pd.DataFrame, args: a
         f"- Success: high reaches entry price * {1 + args.target_return:.2f} within {args.success_bars} trading days",
         f"- Pattern filter: flagpole >= {args.min_flagpole_pct * 100:.0f}%, peak drawdown >= {args.min_peak_drawdown_pct * 100:.0f}%, pullback volume <= {args.max_pullback_volume_ratio * 100:.0f}% of impulse volume, retest within {args.max_retest_bars} bars and within {args.max_days_since_peak} bars after peak",
         f"- Platform filter: previous {args.min_base_bars} trading days, turnover >= {args.min_platform_turnover_pct:.0f}%, amplitude {args.min_platform_amplitude_pct:.0f}%-{args.max_platform_amplitude_pct:.0f}%, gain <= {args.max_platform_gain_pct:.0f}%",
-        f"- Market filter: {'disabled' if args.disable_market_filter else f'above MA20 >= {args.min_market_above_ma20_rate:.0%}, above MA60 >= {args.min_market_above_ma60_rate:.0%}, advance >= {args.min_market_advance_rate:.0%}'}",
+        f"- Market filter: {'disabled' if args.disable_market_filter else f'broad bull if above MA20 >= {args.min_market_above_ma20_rate:.0%}, above MA60 >= {args.min_market_above_ma60_rate:.0%}, advance >= {args.min_market_advance_rate:.0%}; structural bull allowed={args.allow_structural_bull}, ret120_p95 >= {args.min_structural_ret120_p95:.0%}, p95-median spread >= {args.min_structural_return_spread:.0%}'}",
         f"- Reversal diagnostics: first {args.reversal_bars} trading days after entry",
         "",
     ]
@@ -778,8 +930,10 @@ def build_summary_markdown(trades: pd.DataFrame, failures: pd.DataFrame, args: a
                 [
                     f"- Median market above MA20 rate: {trades['market_above_ma20_rate'].median() * 100:.2f}%",
                     f"- Median market above MA60 rate: {trades['market_above_ma60_rate'].median() * 100:.2f}%",
+                    f"- Median market ret120 p95: {trades['market_ret120_p95'].median() * 100:.2f}%",
+                    f"- Median market ret120 p95-median spread: {trades['market_ret120_spread_p95_median'].median() * 100:.2f}%",
                 ]
-                if "market_above_ma20_rate" in trades.columns
+                if "market_above_ma20_rate" in trades.columns and "market_ret120_p95" in trades.columns
                 else []
             ),
             f"- Data failures: {len(failures)}",
@@ -789,6 +943,9 @@ def build_summary_markdown(trades: pd.DataFrame, failures: pd.DataFrame, args: a
             "",
             "## Similarity Buckets",
             build_similarity_summary(trades).to_markdown(index=False),
+            "",
+            "## Market Regimes",
+            build_market_regime_summary(trades).to_markdown(index=False),
             "",
             "## Reversal Diagnostics",
         ]

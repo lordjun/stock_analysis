@@ -291,6 +291,8 @@ class KlineModelResearchTests(unittest.TestCase):
                 bar("2025-03-07", 13.00, 13.40, 12.60, 12.75, 1200),
             ]
         )
+        for row in rows:
+            row["turnover_rate"] = 6.0
 
         signals = find_jianghua_acceleration_retests(
             pd.DataFrame(rows),
@@ -298,6 +300,7 @@ class KlineModelResearchTests(unittest.TestCase):
             min_base_bars=20,
             max_peak_bars=5,
             max_retest_bars=8,
+            max_days_since_peak=5,
             breakout_buffer=0.005,
             support_tolerance=0.02,
             min_flagpole_pct=0.15,
@@ -308,6 +311,7 @@ class KlineModelResearchTests(unittest.TestCase):
             max_close_above_support_pct=0.09,
             min_breakout_volume_ratio=1.5,
             max_pullback_volume_ratio=0.8,
+            min_platform_amplitude_pct=0,
             ma_fast=5,
             ma_slow=20,
             first_retest_only=False,
@@ -335,6 +339,8 @@ class KlineModelResearchTests(unittest.TestCase):
                 bar("2025-03-05", 12.70, 12.90, 12.30, 12.55, 1200),
             ]
         )
+        for row in rows:
+            row["turnover_rate"] = 6.0
 
         signals = find_jianghua_acceleration_retests(
             pd.DataFrame(rows),
@@ -342,6 +348,7 @@ class KlineModelResearchTests(unittest.TestCase):
             min_base_bars=20,
             max_peak_bars=5,
             max_retest_bars=8,
+            max_days_since_peak=5,
             breakout_buffer=0.005,
             support_tolerance=0.02,
             min_flagpole_pct=0.15,
@@ -352,6 +359,7 @@ class KlineModelResearchTests(unittest.TestCase):
             max_close_above_support_pct=0.09,
             min_breakout_volume_ratio=1.5,
             max_pullback_volume_ratio=0.8,
+            min_platform_amplitude_pct=0,
             ma_fast=5,
             ma_slow=20,
             first_retest_only=False,

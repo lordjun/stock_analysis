@@ -642,25 +642,35 @@ def find_stage_high_breakout_retests(
 
 def find_jianghua_acceleration_retests(
     bars: pd.DataFrame,
-    structure_lookback_bars: int = 60,
-    min_base_bars: int = 30,
+    structure_lookback_bars: int = 120,
+    min_base_bars: int = 120,
     max_peak_bars: int = 5,
-    max_retest_bars: int = 10,
+    max_retest_bars: int = 5,
+    max_days_since_peak: int = 2,
     breakout_buffer: float = 0.005,
     support_tolerance: float = 0.02,
-    min_flagpole_pct: float = 0.15,
+    min_flagpole_pct: float = 0.22,
     max_flagpole_pct: float = 0.45,
-    min_peak_drawdown_pct: float = 0.10,
+    min_peak_drawdown_pct: float = 0.16,
     max_peak_drawdown_pct: float = 0.28,
     min_close_above_support_pct: float = 0.02,
     max_close_above_support_pct: float = 0.09,
     min_breakout_volume_ratio: float = 1.5,
-    max_pullback_volume_ratio: float = 0.8,
+    max_pullback_volume_ratio: float = 0.70,
+    min_platform_turnover_pct: float = 100.0,
+    min_platform_amplitude_pct: float = 35.0,
+    max_platform_amplitude_pct: float = 100.0,
+    max_platform_gain_pct: float = 20.0,
     ma_fast: int = 20,
     ma_slow: int = 60,
     first_retest_only: bool = True,
 ) -> list[PatternSignal]:
     df = _prepare_bars(bars)
+    if "turnover_rate" in bars.columns:
+        turnover = bars[["date", "turnover_rate"]].copy()
+        turnover["date"] = pd.to_datetime(turnover["date"])
+        turnover["turnover_rate"] = pd.to_numeric(turnover["turnover_rate"], errors="coerce")
+        df = df.merge(turnover, on="date", how="left")
     df["ma_fast"] = df["close"].rolling(ma_fast).mean()
     df["ma_slow"] = df["close"].rolling(ma_slow).mean()
     signals: list[PatternSignal] = []
@@ -671,6 +681,13 @@ def find_jianghua_acceleration_retests(
         base_window = df.iloc[breakout_index - min_base_bars : breakout_index]
         structure_high = float(prior_window["close"].max())
         base_low = float(base_window["low"].min())
+        platform_high = float(base_window["high"].max())
+        platform_low = float(base_window["low"].min())
+        platform_gain_pct = float(base_window.iloc[-1]["close"]) / float(base_window.iloc[0]["close"]) - 1
+        platform_amplitude_pct = platform_high / platform_low - 1 if platform_low > 0 else float("inf")
+        platform_turnover_pct = (
+            float(base_window["turnover_rate"].sum()) if "turnover_rate" in base_window.columns else float("nan")
+        )
         breakout_close = float(df.at[breakout_index, "close"])
         fast = float(df.at[breakout_index, "ma_fast"])
         slow = float(df.at[breakout_index, "ma_slow"])
@@ -678,7 +695,14 @@ def find_jianghua_acceleration_retests(
 
         broke_structure_high = breakout_close >= structure_high * (1 + breakout_buffer)
         had_trend = breakout_close > fast > slow
-        if not (broke_structure_high and had_trend and prior_avg_volume > 0):
+        platform_ok = (
+            pd.notna(platform_turnover_pct)
+            and platform_turnover_pct >= min_platform_turnover_pct
+            and platform_amplitude_pct >= min_platform_amplitude_pct / 100
+            and platform_amplitude_pct <= max_platform_amplitude_pct / 100
+            and platform_gain_pct <= max_platform_gain_pct / 100
+        )
+        if not (broke_structure_high and had_trend and prior_avg_volume > 0 and platform_ok):
             continue
 
         latest_peak_search_index = min(len(df), breakout_index + max_peak_bars + 1)
@@ -689,6 +713,8 @@ def find_jianghua_acceleration_retests(
                 continue
             peak_index = int(impulse["high"].idxmax())
             if peak_index <= breakout_index or peak_index >= retest_index:
+                continue
+            if retest_index - peak_index > max_days_since_peak:
                 continue
 
             peak_high = float(df.at[peak_index, "high"])
@@ -749,6 +775,9 @@ def find_jianghua_acceleration_retests(
                         "impulse_volume": impulse_volume,
                         "pullback_volume": pullback_volume,
                         "pullback_volume_ratio": pullback_volume / impulse_volume if impulse_volume else 0.0,
+                        "platform_turnover_pct": platform_turnover_pct,
+                        "platform_amplitude_pct": platform_amplitude_pct * 100,
+                        "platform_gain_pct": platform_gain_pct * 100,
                         "similarity_score": similarity,
                         "ma_fast": fast,
                         "ma_slow": slow,
@@ -1193,20 +1222,25 @@ def _default_model_params(model_name: str) -> dict[str, object]:
         }
     if model_name == "jianghua_acceleration_retest":
         return {
-            "structure_lookback_bars": 60,
-            "min_base_bars": 30,
+            "structure_lookback_bars": 120,
+            "min_base_bars": 120,
             "max_peak_bars": 5,
-            "max_retest_bars": 10,
+            "max_retest_bars": 5,
+            "max_days_since_peak": 2,
             "breakout_buffer": 0.005,
             "support_tolerance": 0.02,
-            "min_flagpole_pct": 0.15,
+            "min_flagpole_pct": 0.22,
             "max_flagpole_pct": 0.45,
-            "min_peak_drawdown_pct": 0.10,
+            "min_peak_drawdown_pct": 0.16,
             "max_peak_drawdown_pct": 0.28,
             "min_close_above_support_pct": 0.02,
             "max_close_above_support_pct": 0.09,
             "min_breakout_volume_ratio": 1.5,
-            "max_pullback_volume_ratio": 0.8,
+            "max_pullback_volume_ratio": 0.70,
+            "min_platform_turnover_pct": 100.0,
+            "min_platform_amplitude_pct": 35.0,
+            "max_platform_amplitude_pct": 100.0,
+            "max_platform_gain_pct": 20.0,
             "ma_fast": 20,
             "ma_slow": 60,
         }

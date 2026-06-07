@@ -14,6 +14,49 @@ from kline_model_research import (
     normalize_price_bars,
 )
 from tdx_data import read_tdx_daily_bars
+from backtest_jianghua_success import (
+    _market_context_lookup,
+    attach_turnover_rate_from_float_share,
+    find_jianghua_acceleration_retests_fast,
+    load_float_share_by_code,
+    load_or_build_market_context,
+    market_context_passes_filter,
+)
+
+
+CANDIDATE_COLUMNS = [
+    "code",
+    "name",
+    "model",
+    "signal_date",
+    "latest_close",
+    "breakout_date",
+    "breakout_close",
+    "breakout_high",
+    "prior_high",
+    "structure_high",
+    "peak_high",
+    "pullback_low",
+    "days_since_breakout",
+    "days_since_peak",
+    "distance_to_prior_high_pct",
+    "flagpole_pct",
+    "peak_drawdown_pct",
+    "drawdown_from_breakout_high_pct",
+    "pullback_volume_ratio",
+    "similarity_score",
+    "signal_initial_stop_price",
+    "trigger_price",
+    "ma_fast",
+    "ma_slow",
+    "market_advance_rate",
+    "market_above_ma20_rate",
+    "market_above_ma60_rate",
+    "market_new_high_60_rate",
+    "data_source",
+    "note",
+]
+FAILURE_COLUMNS = ["code", "name", "reason"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -31,24 +74,38 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-workers", type=int, default=16)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--lookback-bars", type=int, default=60)
-    parser.add_argument("--min-base-bars", type=int, default=30)
-    parser.add_argument("--max-retest-bars", type=int, default=10)
+    parser.add_argument("--min-base-bars", type=int, default=120)
+    parser.add_argument("--max-retest-bars", type=int, default=5)
     parser.add_argument("--breakout-buffer", type=float, default=0.005)
     parser.add_argument("--support-tolerance", type=float, default=0.015)
     parser.add_argument("--min-pullback-pct", type=float, default=0.03)
     parser.add_argument("--max-extension-pct", type=float, default=0.08)
     parser.add_argument("--ma-fast", type=int, default=20)
     parser.add_argument("--ma-slow", type=int, default=60)
-    parser.add_argument("--structure-lookback-bars", type=int, default=60)
+    parser.add_argument("--structure-lookback-bars", type=int, default=120)
     parser.add_argument("--max-peak-bars", type=int, default=5)
-    parser.add_argument("--min-flagpole-pct", type=float, default=0.15)
+    parser.add_argument("--min-flagpole-pct", type=float, default=0.22)
     parser.add_argument("--max-flagpole-pct", type=float, default=0.45)
-    parser.add_argument("--min-peak-drawdown-pct", type=float, default=0.10)
+    parser.add_argument("--min-peak-drawdown-pct", type=float, default=0.16)
     parser.add_argument("--max-peak-drawdown-pct", type=float, default=0.28)
+    parser.add_argument("--max-days-since-peak", type=int, default=2)
     parser.add_argument("--min-close-above-support-pct", type=float, default=0.02)
     parser.add_argument("--max-close-above-support-pct", type=float, default=0.09)
     parser.add_argument("--min-breakout-volume-ratio", type=float, default=1.5)
-    parser.add_argument("--max-pullback-volume-ratio", type=float, default=0.8)
+    parser.add_argument("--max-pullback-volume-ratio", type=float, default=0.70)
+    parser.add_argument("--min-platform-turnover-pct", type=float, default=100.0)
+    parser.add_argument("--min-platform-amplitude-pct", type=float, default=35.0)
+    parser.add_argument("--max-platform-amplitude-pct", type=float, default=100.0)
+    parser.add_argument("--max-platform-gain-pct", type=float, default=20.0)
+    parser.add_argument("--disable-market-filter", action="store_true")
+    parser.add_argument("--market-context-cache", default=None)
+    parser.add_argument("--min-market-above-ma20-rate", type=float, default=0.45)
+    parser.add_argument("--min-market-above-ma60-rate", type=float, default=0.35)
+    parser.add_argument("--min-market-advance-rate", type=float, default=0.0)
+    parser.add_argument("--float-share-cache", default=None)
+    parser.add_argument("--float-share-provider", choices=["auto", "tdx", "tushare", "eastmoney"], default="auto")
+    parser.add_argument("--tdx-base-dbf", default=r"C:\new_tdx\T0002\hq_cache\base.dbf")
+    parser.add_argument("--tushare-token-env", default="TUSHARE_TOKEN")
     return parser
 
 
@@ -68,6 +125,13 @@ def run(args: argparse.Namespace) -> list[Path]:
     if args.limit:
         universe = universe.head(args.limit)
     items = [(str(row.code).zfill(6), str(row.name)) for row in universe.itertuples(index=False)]
+    if args.model == "jianghua_acceleration_retest":
+        args.signal_end_date = args.end_date
+        args.history_start_date = args.start_date
+        args.float_share_by_code = load_float_share_by_code(args)
+        args.market_context_by_date = {}
+        if not args.disable_market_filter:
+            args.market_context_by_date = _market_context_lookup(load_or_build_market_context(items, args))
 
     rows: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
@@ -84,28 +148,35 @@ def run(args: argparse.Namespace) -> list[Path]:
             if done % 250 == 0:
                 print(f"scan_done {done}/{len(items)} candidates={len(rows)} failures={len(failures)}", flush=True)
 
-    candidates = pd.DataFrame(rows).sort_values(["signal_date", "code"], ascending=[False, True]) if rows else pd.DataFrame(rows)
+    candidates = (
+        pd.DataFrame(rows).sort_values(["signal_date", "code"], ascending=[False, True])
+        if rows
+        else pd.DataFrame(columns=CANDIDATE_COLUMNS)
+    )
     candidates_path = output_dir / "candidates.csv"
     failures_path = output_dir / "failures.csv"
     candidates.to_csv(candidates_path, index=False, encoding="utf-8-sig")
-    pd.DataFrame(failures).to_csv(failures_path, index=False, encoding="utf-8-sig")
+    pd.DataFrame(failures, columns=FAILURE_COLUMNS).to_csv(failures_path, index=False, encoding="utf-8-sig")
     print(f"DONE total={len(items)} candidates={len(rows)} failures={len(failures)}", flush=True)
     return [candidates_path, failures_path]
 
 
 def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object] | None:
     daily = fetch_daily_bars(code, args)
+    if args.model == "jianghua_acceleration_retest":
+        daily = attach_turnover_rate_from_float_share(daily, code, args.float_share_by_code)
     min_history = max(args.lookback_bars, args.structure_lookback_bars, args.ma_slow) + args.max_retest_bars + 1
     if len(daily) < min_history:
         return None
 
     if args.model == "jianghua_acceleration_retest":
-        signals = find_jianghua_acceleration_retests(
+        signals = find_jianghua_acceleration_retests_fast(
             daily,
             structure_lookback_bars=args.structure_lookback_bars,
             min_base_bars=args.min_base_bars,
             max_peak_bars=args.max_peak_bars,
             max_retest_bars=args.max_retest_bars,
+            max_days_since_peak=args.max_days_since_peak,
             breakout_buffer=args.breakout_buffer,
             support_tolerance=args.support_tolerance,
             min_flagpole_pct=args.min_flagpole_pct,
@@ -116,9 +187,12 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
             max_close_above_support_pct=args.max_close_above_support_pct,
             min_breakout_volume_ratio=args.min_breakout_volume_ratio,
             max_pullback_volume_ratio=args.max_pullback_volume_ratio,
+            min_platform_turnover_pct=args.min_platform_turnover_pct,
+            min_platform_amplitude_pct=args.min_platform_amplitude_pct,
+            max_platform_amplitude_pct=args.max_platform_amplitude_pct,
+            max_platform_gain_pct=args.max_platform_gain_pct,
             ma_fast=args.ma_fast,
             ma_slow=args.ma_slow,
-            first_retest_only=False,
         )
     else:
         signals = find_stage_high_breakout_retests(
@@ -142,6 +216,16 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
     if not latest_signals:
         return None
     signal = max(latest_signals, key=lambda item: float(item.metadata.get("similarity_score", item.metadata.get("prior_high", 0.0))))
+    market_context = None
+    if args.model == "jianghua_acceleration_retest":
+        market_context = args.market_context_by_date.get(pd.Timestamp(signal.signal_date).strftime("%Y-%m-%d"))
+        if not args.disable_market_filter and not market_context_passes_filter(
+            market_context,
+            args.min_market_above_ma20_rate,
+            args.min_market_above_ma60_rate,
+            args.min_market_advance_rate,
+        ):
+            return None
 
     metadata = signal.metadata
     breakout_index = int(metadata["breakout_index"])
@@ -176,6 +260,10 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
         "trigger_price": round(float(signal.trigger_price), 3),
         "ma_fast": round(float(metadata["ma_fast"]), 3),
         "ma_slow": round(float(metadata["ma_slow"]), 3),
+        "market_advance_rate": round(float((market_context or {}).get("advance_rate", 0.0)), 4),
+        "market_above_ma20_rate": round(float((market_context or {}).get("above_ma20_rate", 0.0)), 4),
+        "market_above_ma60_rate": round(float((market_context or {}).get("above_ma60_rate", 0.0)), 4),
+        "market_new_high_60_rate": round(float((market_context or {}).get("new_high_60_rate", 0.0)), 4),
         "data_source": daily.attrs.get("data_source", "unknown"),
         "note": f"{args.model}_daily; watchlist_only",
     }

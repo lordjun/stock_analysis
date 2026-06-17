@@ -210,6 +210,39 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         self.assertEqual(1, len(loose))
         self.assertEqual([], tight)
 
+    def test_fast_signal_finder_accepts_steady_climb_after_mild_breakout(self) -> None:
+        rows = []
+        for index in range(120):
+            day = str(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index))
+            close = 10.8 + (index % 20) * 0.03
+            rows.append({**bar(day, close, 12.0, 8.8, close, 1000), "turnover_rate": 1.0})
+        rows.extend(
+            [
+                {**bar("2025-05-02", 12.05, 12.25, 11.75, 12.12, 1300), "turnover_rate": 2.0},
+                {**bar("2025-05-03", 12.18, 12.55, 11.85, 12.35, 1200), "turnover_rate": 2.0},
+                {**bar("2025-05-04", 12.35, 12.95, 12.10, 12.80, 1250), "turnover_rate": 2.0},
+                {**bar("2025-05-05", 12.80, 13.35, 12.45, 13.10, 1350), "turnover_rate": 2.0},
+                {**bar("2025-05-06", 13.05, 13.25, 12.70, 12.95, 1050), "turnover_rate": 2.0},
+            ]
+        )
+
+        signals = find_jianghua_acceleration_retests_fast(
+            pd.DataFrame(rows),
+            structure_lookback_bars=120,
+            min_base_bars=120,
+            min_platform_amplitude_pct=35,
+            max_platform_amplitude_pct=100,
+            min_platform_turnover_pct=100,
+            max_platform_gain_pct=20,
+            ma_fast=5,
+            ma_slow=20,
+        )
+
+        self.assertTrue(signals)
+        self.assertEqual("steady_climb_retest", signals[0].metadata["pattern_subtype"])
+        self.assertLess(signals[0].metadata["flagpole_pct"], 0.22)
+        self.assertGreaterEqual(signals[0].metadata["breakout_volume_ratio"], 1.1)
+
     def test_market_context_builds_breadth_rates_and_filter(self) -> None:
         frames = {
             "000001": pd.DataFrame(

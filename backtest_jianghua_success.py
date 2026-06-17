@@ -612,6 +612,16 @@ def find_jianghua_acceleration_retests_fast(
     max_platform_gain_pct: float = 20.0,
     ma_fast: int = 20,
     ma_slow: int = 60,
+    steady_max_retest_bars: int = 15,
+    steady_min_breakout_volume_ratio: float = 1.10,
+    steady_min_climb_pct: float = 0.08,
+    steady_max_climb_pct: float = 0.25,
+    steady_support_tolerance: float = 0.03,
+    steady_max_drawdown_pct: float = 0.12,
+    steady_min_close_above_support_pct: float = 0.02,
+    steady_max_close_above_support_pct: float = 0.18,
+    steady_max_pullback_volume_ratio: float = 1.30,
+    steady_ma_slow_tolerance: float = 0.005,
 ) -> list[PatternSignal]:
     df = normalize_price_bars(bars)
     if df.empty:
@@ -638,6 +648,17 @@ def find_jianghua_acceleration_retests_fast(
     ma_fast_values = df["close"].rolling(ma_fast).mean().to_numpy(dtype=float)
     ma_slow_values = df["close"].rolling(ma_slow).mean().to_numpy(dtype=float)
     prior_avg_volume = df["volume"].rolling(20).mean().shift(1).to_numpy(dtype=float)
+    platform_ok = _platform_mask(
+        platform_high,
+        platform_low,
+        platform_start_close,
+        platform_end_close,
+        platform_turnover,
+        min_platform_turnover_pct,
+        min_platform_amplitude_pct,
+        max_platform_amplitude_pct,
+        max_platform_gain_pct,
+    )
 
     first_breakout = max(structure_lookback_bars, min_base_bars, ma_slow)
     breakout_mask = (
@@ -651,17 +672,7 @@ def find_jianghua_acceleration_retests_fast(
         & (close >= structure_high * (1 + breakout_buffer))
         & (close > ma_fast_values)
         & (ma_fast_values > ma_slow_values)
-        & _platform_mask(
-            platform_high,
-            platform_low,
-            platform_start_close,
-            platform_end_close,
-            platform_turnover,
-            min_platform_turnover_pct,
-            min_platform_amplitude_pct,
-            max_platform_amplitude_pct,
-            max_platform_gain_pct,
-        )
+        & platform_ok
     )
 
     signals: list[PatternSignal] = []
@@ -702,6 +713,7 @@ def find_jianghua_acceleration_retests_fast(
                 continue
 
             pullback_volume_ratio = pullback_volume / impulse_volume if impulse_volume else 0.0
+            breakout_volume_ratio = float(volume[breakout_index]) / float(prior_avg_volume[breakout_index])
             signals.append(
                 PatternSignal(
                     model=MODEL_NAME,
@@ -727,9 +739,11 @@ def find_jianghua_acceleration_retests_fast(
                         "impulse_volume": impulse_volume,
                         "pullback_volume": pullback_volume,
                         "pullback_volume_ratio": pullback_volume_ratio,
+                        "breakout_volume_ratio": breakout_volume_ratio,
                         "platform_turnover_pct": float(platform_turnover[breakout_index]),
                         "platform_amplitude_pct": float(platform_high[breakout_index] / platform_low[breakout_index] - 1) * 100,
                         "platform_gain_pct": float(platform_end_close[breakout_index] / platform_start_close[breakout_index] - 1) * 100,
+                        "pattern_subtype": "acceleration_retest",
                         "similarity_score": _jianghua_similarity_score(
                             flagpole_pct=flagpole_pct,
                             peak_drawdown_pct=peak_drawdown_pct,
@@ -742,6 +756,107 @@ def find_jianghua_acceleration_retests_fast(
                     },
                 )
             )
+            break
+
+    steady_breakout_mask = (
+        (np.arange(len(df)) >= first_breakout)
+        & (np.arange(len(df)) < len(df) - 2)
+        & np.isfinite(structure_high)
+        & np.isfinite(ma_fast_values)
+        & np.isfinite(ma_slow_values)
+        & np.isfinite(prior_avg_volume)
+        & (prior_avg_volume > 0)
+        & (close >= structure_high * (1 + breakout_buffer))
+        & (close > ma_fast_values)
+        & (close > ma_slow_values)
+        & (ma_fast_values >= ma_slow_values * (1 - steady_ma_slow_tolerance))
+        & (volume >= prior_avg_volume * steady_min_breakout_volume_ratio)
+        & platform_ok
+    )
+    signaled_indices = {signal.signal_index for signal in signals}
+    for breakout_index in np.flatnonzero(steady_breakout_mask):
+        latest_retest_index = min(len(df), breakout_index + steady_max_retest_bars + 1)
+        for retest_index in range(breakout_index + 2, latest_retest_index):
+            if retest_index in signaled_indices:
+                continue
+            climb_highs = high[breakout_index + 1 : retest_index + 1]
+            if len(climb_highs) == 0:
+                continue
+            peak_index = int(breakout_index + 1 + np.argmax(climb_highs))
+            if peak_index >= retest_index:
+                continue
+
+            support_level = float(structure_high[breakout_index])
+            peak_high = float(high[peak_index])
+            climb_pct = peak_high / support_level - 1
+            if not (steady_min_climb_pct <= climb_pct <= steady_max_climb_pct):
+                continue
+
+            pullback_low = float(np.min(low[breakout_index + 1 : retest_index + 1]))
+            post_peak_low = float(np.min(low[peak_index : retest_index + 1]))
+            peak_drawdown_pct = 1 - post_peak_low / peak_high
+            close_above_support_pct = float(close[retest_index]) / support_level - 1
+            impulse_volume = float(np.mean(volume[breakout_index : peak_index + 1]))
+            pullback_volume = float(np.mean(volume[peak_index + 1 : retest_index + 1]))
+            pullback_volume_ratio = pullback_volume / impulse_volume if impulse_volume else 0.0
+            breakout_volume_ratio = float(volume[breakout_index]) / float(prior_avg_volume[breakout_index])
+            trend_window = close[breakout_index : retest_index + 1] > ma_fast_values[breakout_index : retest_index + 1]
+            trend_quality = float(np.mean(trend_window)) if len(trend_window) else 0.0
+
+            if pullback_low < support_level * (1 - steady_support_tolerance):
+                continue
+            if peak_drawdown_pct > steady_max_drawdown_pct:
+                continue
+            if not (steady_min_close_above_support_pct <= close_above_support_pct <= steady_max_close_above_support_pct):
+                continue
+            if pullback_volume_ratio > steady_max_pullback_volume_ratio:
+                continue
+            if trend_quality < 0.60:
+                continue
+
+            signals.append(
+                PatternSignal(
+                    model=MODEL_NAME,
+                    signal_index=int(retest_index),
+                    signal_date=pd.Timestamp(dates[retest_index]),
+                    trigger_price=float(close[retest_index]),
+                    initial_stop=support_level * (1 - steady_support_tolerance),
+                    metadata={
+                        "breakout_index": float(breakout_index),
+                        "peak_index": float(peak_index),
+                        "structure_high": support_level,
+                        "base_low": float(base_low[breakout_index]),
+                        "breakout_close": float(close[breakout_index]),
+                        "breakout_high": float(high[breakout_index]),
+                        "peak_high": peak_high,
+                        "pullback_low": pullback_low,
+                        "days_since_breakout": float(retest_index - breakout_index),
+                        "days_since_peak": float(retest_index - peak_index),
+                        "flagpole_pct": climb_pct,
+                        "peak_drawdown_pct": peak_drawdown_pct,
+                        "close_above_support_pct": close_above_support_pct,
+                        "prior_avg_volume": float(prior_avg_volume[breakout_index]),
+                        "impulse_volume": impulse_volume,
+                        "pullback_volume": pullback_volume,
+                        "pullback_volume_ratio": pullback_volume_ratio,
+                        "breakout_volume_ratio": breakout_volume_ratio,
+                        "platform_turnover_pct": float(platform_turnover[breakout_index]),
+                        "platform_amplitude_pct": float(platform_high[breakout_index] / platform_low[breakout_index] - 1) * 100,
+                        "platform_gain_pct": float(platform_end_close[breakout_index] / platform_start_close[breakout_index] - 1) * 100,
+                        "pattern_subtype": "steady_climb_retest",
+                        "similarity_score": _steady_climb_similarity_score(
+                            climb_pct=climb_pct,
+                            peak_drawdown_pct=peak_drawdown_pct,
+                            close_above_support_pct=close_above_support_pct,
+                            days_since_breakout=retest_index - breakout_index,
+                            pullback_volume_ratio=pullback_volume_ratio,
+                        ),
+                        "ma_fast": float(ma_fast_values[breakout_index]),
+                        "ma_slow": float(ma_slow_values[breakout_index]),
+                    },
+                )
+            )
+            signaled_indices.add(int(retest_index))
             break
     return signals
 
@@ -787,6 +902,7 @@ def evaluate_signal(
         "code": code,
         "name": name,
         "model": MODEL_NAME,
+        "pattern_subtype": str(metadata.get("pattern_subtype", "")),
         "signal_index": int(signal.signal_index),
         "entry_index": int(entry_index),
         "signal_date": _fmt_date(signal.signal_date),
@@ -828,6 +944,7 @@ def evaluate_signal(
         "peak_drawdown_pct": round(float(metadata["peak_drawdown_pct"]) * 100, 2),
         "close_above_support_pct": round(float(metadata["close_above_support_pct"]) * 100, 2),
         "prior_avg_volume": round(float(metadata["prior_avg_volume"]), 2),
+        "breakout_volume_ratio": round(float(metadata.get("breakout_volume_ratio", 0.0)), 4),
         "impulse_volume": round(float(metadata["impulse_volume"]), 2),
         "pullback_volume": round(float(metadata["pullback_volume"]), 2),
         "pullback_volume_ratio": round(float(metadata["pullback_volume_ratio"]), 4),
@@ -1071,6 +1188,38 @@ def _jianghua_similarity_score(
     }
     values = {
         "flagpole_pct": flagpole_pct,
+        "peak_drawdown_pct": peak_drawdown_pct,
+        "close_above_support_pct": close_above_support_pct,
+        "days_since_breakout": float(days_since_breakout),
+        "pullback_volume_ratio": pullback_volume_ratio,
+    }
+    scores = [max(0.0, 1 - abs(values[key] - targets[key]) / tolerances[key]) for key in targets]
+    return float(sum(scores) / len(scores) * 100)
+
+
+def _steady_climb_similarity_score(
+    climb_pct: float,
+    peak_drawdown_pct: float,
+    close_above_support_pct: float,
+    days_since_breakout: int,
+    pullback_volume_ratio: float,
+) -> float:
+    targets = {
+        "climb_pct": 0.13,
+        "peak_drawdown_pct": 0.06,
+        "close_above_support_pct": 0.09,
+        "days_since_breakout": 8.0,
+        "pullback_volume_ratio": 0.90,
+    }
+    tolerances = {
+        "climb_pct": 0.08,
+        "peak_drawdown_pct": 0.06,
+        "close_above_support_pct": 0.09,
+        "days_since_breakout": 7.0,
+        "pullback_volume_ratio": 0.45,
+    }
+    values = {
+        "climb_pct": climb_pct,
         "peak_drawdown_pct": peak_drawdown_pct,
         "close_above_support_pct": close_above_support_pct,
         "days_since_breakout": float(days_since_breakout),

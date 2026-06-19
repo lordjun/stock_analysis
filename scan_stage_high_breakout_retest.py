@@ -17,6 +17,13 @@ from kline_model_research import (
     find_stage_high_breakout_retests,
     normalize_price_bars,
 )
+from mainline_pool import (
+    DynamicMainlinePoolProvider,
+    MainlinePoolConfig,
+    core_mainline_concept_matches,
+    load_or_fetch_stock_concepts,
+    parse_theme_keywords as parse_mainline_theme_keywords,
+)
 from tdx_data import read_tdx_daily_bars
 from backtest_jianghua_success import (
     _market_context_lookup,
@@ -27,6 +34,7 @@ from backtest_jianghua_success import (
     load_or_build_market_context,
     load_structural_code_pool,
     market_context_passes_filter,
+    signal_quality_passes_filter,
 )
 
 
@@ -67,6 +75,8 @@ CANDIDATE_COLUMNS = [
     "market_ret120_p95",
     "market_ret120_spread_p95_median",
     "data_source",
+    "concept_boards",
+    "matched_mainline_boards",
     "note",
 ]
 FAILURE_COLUMNS = ["code", "name", "reason"]
@@ -111,6 +121,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-platform-amplitude-pct", type=float, default=35.0)
     parser.add_argument("--max-platform-amplitude-pct", type=float, default=100.0)
     parser.add_argument("--max-platform-gain-pct", type=float, default=20.0)
+    parser.add_argument("--min-signal-platform-gain-pct", type=float, default=12.0)
+    parser.add_argument("--max-signal-pullback-volume-ratio", type=float, default=0.80)
+    parser.add_argument("--semiconductor-exception-min-breakout-volume-ratio", type=float, default=3.0)
+    parser.add_argument("--semiconductor-exception-max-pullback-volume-ratio", type=float, default=0.60)
     parser.add_argument("--disable-market-filter", action="store_true")
     parser.add_argument("--market-context-cache", default=None)
     parser.add_argument("--min-market-above-ma20-rate", type=float, default=0.45)
@@ -120,12 +134,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-structural-ret120-p95", type=float, default=0.30)
     parser.add_argument("--min-structural-return-spread", type=float, default=0.35)
     parser.add_argument("--structural-code-pool-file", default=None)
+    parser.add_argument("--mainline-mode", choices=["dynamic", "static", "none"], default="dynamic")
+    parser.add_argument("--dynamic-mainline-cache-dir", default="data/cache/mainline_pools")
     parser.add_argument("--structural-code-pool-cache", default=None)
     parser.add_argument("--structural-pool-mode", choices=["long_term", "current"], default="long_term")
     parser.add_argument("--structural-concept-top-n", type=int, default=10)
     parser.add_argument("--structural-concept-lookback-days", type=int, default=540)
-    parser.add_argument("--min-structural-concept-ret120", type=float, default=0.20)
-    parser.add_argument("--min-structural-concept-ret250", type=float, default=0.50)
+    parser.add_argument("--min-structural-concept-ret120", type=float, default=0.10)
+    parser.add_argument("--min-structural-concept-ret250", type=float, default=0.20)
+    parser.add_argument("--min-structural-concept-ret60", type=float, default=0.05)
+    parser.add_argument("--min-structural-concept-breadth120", type=float, default=0.55)
+    parser.add_argument("--mainline-fallback-top-rank", type=int, default=5)
+    parser.add_argument("--mainline-fallback-min-matches-outside-top-rank", type=int, default=2)
     parser.add_argument(
         "--structural-theme-keywords",
         default="AI,算力,CPO,光模块,机器人,半导体,芯片,6G,数据中心,东数西算,云计算,软件,信创,低空,无人机,卫星,军工信息化,新型工业化,存储,PCB,消费电子",
@@ -146,21 +166,30 @@ def main() -> None:
 
 def run(args: argparse.Namespace) -> list[Path]:
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
 
     universe = ak.stock_info_a_code_name()
     universe = universe[~universe["name"].astype(str).str.upper().str.contains("ST", na=False)].reset_index(drop=True)
     if args.limit:
         universe = universe.head(args.limit)
     items = [(str(row.code).zfill(6), str(row.name)) for row in universe.itertuples(index=False)]
+    market_items = items
     if args.model == "jianghua_acceleration_retest":
         args.signal_end_date = args.end_date
         args.history_start_date = args.start_date
         args.float_share_by_code = load_float_share_by_code(args)
+        args.stock_concepts_by_code = {}
+        args.structural_board_pool = set()
+        args.structural_board_rank = {}
         args.structural_code_pool = load_or_build_structural_code_pool(args)
         args.market_context_by_date = {}
         if not args.disable_market_filter:
-            args.market_context_by_date = _market_context_lookup(load_or_build_market_context(items, args))
+            args.market_context_by_date = _market_context_lookup(load_or_build_market_context(market_items, args))
+        if should_prefilter_with_structural_pool(args) and args.structural_code_pool:
+            items = [(code, name) for code, name in items if code in args.structural_code_pool]
+            print(
+                f"structural_universe_filter kept={len(items)} original={len(market_items)}",
+                flush=True,
+            )
 
     rows: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
@@ -182,17 +211,88 @@ def run(args: argparse.Namespace) -> list[Path]:
         if rows
         else pd.DataFrame(columns=CANDIDATE_COLUMNS)
     )
-    candidates_path = output_dir / "candidates.csv"
-    failures_path = output_dir / "failures.csv"
-    candidates.to_csv(candidates_path, index=False, encoding="utf-8-sig")
-    pd.DataFrame(failures, columns=FAILURE_COLUMNS).to_csv(failures_path, index=False, encoding="utf-8-sig")
+    output_paths = write_scan_outputs(candidates, failures, output_dir, len(items))
     print(f"DONE total={len(items)} candidates={len(rows)} failures={len(failures)}", flush=True)
-    return [candidates_path, failures_path]
+    return output_paths
+
+
+def write_scan_outputs(
+    candidates: pd.DataFrame,
+    failures: list[dict[str, str]],
+    output_dir: Path,
+    total_count: int,
+) -> list[Path]:
+    if candidates.empty:
+        return []
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidates_path = output_dir / "candidates.csv"
+    report_path = output_dir / "report.md"
+    candidates.to_csv(candidates_path, index=False, encoding="utf-8-sig")
+    report_path.write_text(build_candidate_report_markdown(candidates, total_count), encoding="utf-8")
+
+    paths = [candidates_path, report_path]
+    if failures:
+        failures_path = output_dir / "failures.csv"
+        pd.DataFrame(failures, columns=FAILURE_COLUMNS).to_csv(failures_path, index=False, encoding="utf-8-sig")
+        paths.append(failures_path)
+    return paths
+
+
+def build_candidate_report_markdown(candidates: pd.DataFrame, total_count: int) -> str:
+    lines = [
+        "# K-line Model Candidate Report",
+        "",
+        f"- Scanned stocks: {total_count}",
+        f"- Candidates: {len(candidates)}",
+        "",
+    ]
+    for row in candidates.itertuples(index=False):
+        data = row._asdict()
+        lines.extend(
+            [
+                f"## {data.get('code', '')} {data.get('name', '')}",
+                "",
+                f"- Pattern subtype: {data.get('pattern_subtype', '')}",
+                f"- Signal date: {data.get('signal_date', '')}",
+                f"- Breakout date: {data.get('breakout_date', '')}",
+                f"- Latest close: {data.get('latest_close', '')}",
+                f"- Structure high: {data.get('structure_high', '')}",
+                f"- Initial stop: {data.get('signal_initial_stop_price', '')}",
+                f"- Breakout volume ratio: {data.get('breakout_volume_ratio', '')}",
+                f"- Pullback volume ratio: {data.get('pullback_volume_ratio', '')}",
+                f"- Similarity score: {data.get('similarity_score', '')}",
+                f"- Concept boards: {data.get('concept_boards', '')}",
+                f"- Market regime: {data.get('market_regime', '')}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def load_or_build_structural_code_pool(args: argparse.Namespace) -> set[str]:
     if args.structural_code_pool_file:
         return load_structural_code_pool(args.structural_code_pool_file)
+    if args.mainline_mode == "none":
+        return set()
+    if args.mainline_mode == "dynamic":
+        config = MainlinePoolConfig(
+            cache_dir=Path(args.dynamic_mainline_cache_dir),
+            tdx_vipdoc=args.tdx_vipdoc,
+            lookback_days=args.structural_concept_lookback_days,
+            top_n=args.structural_concept_top_n,
+            min_ret60=args.min_structural_concept_ret60,
+            min_ret120=args.min_structural_concept_ret120,
+            min_ret250=args.min_structural_concept_ret250,
+            min_breadth120=args.min_structural_concept_breadth120,
+            theme_keywords=parse_mainline_theme_keywords(args.structural_theme_keywords),
+        )
+        provider = DynamicMainlinePoolProvider(config)
+        codes = provider.codes_for_date(args.end_date)
+        args.structural_board_pool = provider.boards_for_date(args.end_date)
+        args.structural_board_rank = provider.board_ranks_for_date(args.end_date)
+        print(f"dynamic_mainline_ready date={args.end_date} codes={len(codes)}", flush=True)
+        return codes
     if not args.allow_structural_bull:
         return set()
 
@@ -222,6 +322,10 @@ def load_or_build_structural_code_pool(args: argparse.Namespace) -> set[str]:
     pool.to_csv(cache_path, index=False, encoding="utf-8-sig")
     print(f"structural_code_pool_cached rows={len(pool)} path={cache_path}", flush=True)
     return load_structural_code_pool(cache_path)
+
+
+def should_prefilter_with_structural_pool(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "structural_code_pool_file", None))
 
 
 def build_structural_concept_pool(top_n: int) -> pd.DataFrame:
@@ -665,6 +769,21 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
             args.min_structural_ret120_p95,
             args.min_structural_return_spread,
         )
+        structural_match, stock_concepts, matched_boards = stock_matches_structural_theme(
+            args,
+            code,
+            pd.Timestamp(signal.signal_date),
+            getattr(args, "structural_code_pool", set()),
+        )
+        if not signal_quality_passes_filter(
+            signal.metadata,
+            args.min_signal_platform_gain_pct,
+            args.max_signal_pullback_volume_ratio,
+            matched_mainline_boards=matched_boards,
+            semiconductor_exception_min_breakout_volume_ratio=args.semiconductor_exception_min_breakout_volume_ratio,
+            semiconductor_exception_max_pullback_volume_ratio=args.semiconductor_exception_max_pullback_volume_ratio,
+        ):
+            return None
         if not args.disable_market_filter and not market_context_passes_filter(
             market_context,
             args.min_market_above_ma20_rate,
@@ -674,11 +793,20 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
             args.min_structural_ret120_p95,
             args.min_structural_return_spread,
             code=code,
-            structural_code_pool=args.structural_code_pool,
+            structural_code_pool={str(code).zfill(6)} if structural_match else set(),
         ):
             return None
     else:
         market_regime = ""
+        structural_match = str(code).zfill(6) in getattr(args, "structural_code_pool", set())
+        stock_concepts = []
+        matched_boards = []
+        if not signal_quality_passes_filter(
+            signal.metadata,
+            args.min_signal_platform_gain_pct,
+            args.max_signal_pullback_volume_ratio,
+        ):
+            return None
 
     metadata = signal.metadata
     breakout_index = int(metadata["breakout_index"])
@@ -717,7 +845,7 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
         "ma_slow": round(float(metadata["ma_slow"]), 3),
         "market_advance_rate": round(float((market_context or {}).get("advance_rate", 0.0)), 4),
         "market_regime": market_regime,
-        "in_structural_code_pool": str(code).zfill(6) in getattr(args, "structural_code_pool", set()),
+        "in_structural_code_pool": structural_match,
         "market_above_ma20_rate": round(float((market_context or {}).get("above_ma20_rate", 0.0)), 4),
         "market_above_ma60_rate": round(float((market_context or {}).get("above_ma60_rate", 0.0)), 4),
         "market_new_high_60_rate": round(float((market_context or {}).get("new_high_60_rate", 0.0)), 4),
@@ -728,8 +856,44 @@ def scan_one(code: str, name: str, args: argparse.Namespace) -> dict[str, object
             4,
         ),
         "data_source": daily.attrs.get("data_source", "unknown"),
+        "concept_boards": "、".join(stock_concepts),
+        "matched_mainline_boards": "、".join(matched_boards),
         "note": f"{args.model}_daily; watchlist_only",
     }
+
+
+def stock_matches_structural_theme(
+    args: argparse.Namespace,
+    code: str,
+    signal_date: pd.Timestamp,
+    structural_code_pool: set[str],
+) -> tuple[bool, list[str], list[str]]:
+    normalized_code = str(code).zfill(6)
+    if normalized_code in structural_code_pool:
+        return True, [], []
+
+    rank_by_board = getattr(args, "structural_board_rank", {})
+    if not rank_by_board:
+        mainline_boards = getattr(args, "structural_board_pool", set())
+        rank_by_board = {board: 999 for board in mainline_boards}
+    if not rank_by_board:
+        return False, [], []
+
+    concepts_by_code = getattr(args, "stock_concepts_by_code", {})
+    if normalized_code in concepts_by_code:
+        concepts = list(concepts_by_code[normalized_code])
+    else:
+        concepts = load_or_fetch_stock_concepts(Path(getattr(args, "dynamic_mainline_cache_dir", "data/cache/mainline_pools")), normalized_code)
+        concepts_by_code[normalized_code] = concepts
+        args.stock_concepts_by_code = concepts_by_code
+
+    matched = core_mainline_concept_matches(
+        concepts,
+        rank_by_board,
+        top_rank=int(getattr(args, "mainline_fallback_top_rank", 5)),
+        min_matches_outside_top_rank=int(getattr(args, "mainline_fallback_min_matches_outside_top_rank", 2)),
+    )
+    return bool(matched), concepts, matched
 
 
 def fetch_daily_bars(code: str, args: argparse.Namespace) -> pd.DataFrame:

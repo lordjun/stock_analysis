@@ -12,6 +12,10 @@ from backtest_jianghua_success import (
     find_jianghua_acceleration_retests_fast,
     load_structural_code_pool,
     market_context_passes_filter,
+    signal_quality_passes_filter,
+    should_prefilter_with_structural_pool,
+    stock_matches_structural_theme,
+    structural_pool_for_signal,
 )
 from kline_model_research import PatternSignal, find_jianghua_acceleration_retests
 
@@ -25,6 +29,30 @@ def bar(day: str, open_: float, high: float, low: float, close: float, volume: f
         "close": close,
         "volume": volume,
     }
+
+
+def steady_climb_rows(breakout_volume: float = 1700) -> list[dict[str, object]]:
+    rows = []
+    for index in range(120):
+        day = str(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index))
+        close = 10.8 + (index % 20) * 0.03
+        rows.append({**bar(day, close, 12.0, 8.8, close, 1000), "turnover_rate": 1.0})
+    rows.extend(
+        [
+            {**bar("2025-05-02", 12.05, 12.25, 11.75, 12.12, breakout_volume), "turnover_rate": 2.0},
+            {**bar("2025-05-03", 12.18, 12.55, 11.85, 12.35, 1550), "turnover_rate": 2.0},
+            {**bar("2025-05-04", 12.35, 12.95, 12.10, 12.80, 1500), "turnover_rate": 2.0},
+            {**bar("2025-05-05", 12.80, 13.35, 12.45, 13.10, 1600), "turnover_rate": 2.0},
+            {**bar("2025-05-06", 13.05, 13.25, 12.70, 12.95, 1000), "turnover_rate": 2.0},
+        ]
+    )
+    return rows
+
+
+def mainline_turnover_rows() -> list[dict[str, object]]:
+    rows = steady_climb_rows()
+    rows[-1] = {**bar("2025-05-06", 13.05, 13.25, 12.70, 12.95, 1400), "turnover_rate": 2.0}
+    return rows
 
 
 def sample_signal(index: int = 0) -> PatternSignal:
@@ -57,6 +85,77 @@ def sample_signal(index: int = 0) -> PatternSignal:
 
 
 class JianghuaSuccessBacktestTests(unittest.TestCase):
+    def test_dynamic_mainline_does_not_prefilter_universe_before_kline_signal(self) -> None:
+        args = type("Args", (), {"mainline_mode": "dynamic", "structural_code_pool_file": None})()
+
+        self.assertFalse(should_prefilter_with_structural_pool(args))
+
+    def test_manual_structural_code_pool_can_prefilter_universe(self) -> None:
+        args = type("Args", (), {"mainline_mode": "dynamic", "structural_code_pool_file": "pool.csv"})()
+
+        self.assertTrue(should_prefilter_with_structural_pool(args))
+
+    def test_signal_quality_filter_requires_platform_lift_and_shrinking_pullback(self) -> None:
+        self.assertTrue(
+            signal_quality_passes_filter(
+                {"platform_gain_pct": 14.0, "pullback_volume_ratio": 0.75},
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+            )
+        )
+        self.assertFalse(
+            signal_quality_passes_filter(
+                {"platform_gain_pct": 6.0, "pullback_volume_ratio": 0.75},
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+            )
+        )
+        self.assertFalse(
+            signal_quality_passes_filter(
+                {"platform_gain_pct": 14.0, "pullback_volume_ratio": 0.90},
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+            )
+        )
+
+    def test_signal_quality_filter_allows_strong_semiconductor_mainline_exception(self) -> None:
+        metadata = {
+            "platform_gain_pct": 6.9,
+            "breakout_volume_ratio": 3.2,
+            "pullback_volume_ratio": 0.55,
+        }
+
+        self.assertTrue(
+            signal_quality_passes_filter(
+                metadata,
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+                matched_mainline_boards=["存储芯片", "芯片概念"],
+                semiconductor_exception_min_breakout_volume_ratio=3.0,
+                semiconductor_exception_max_pullback_volume_ratio=0.60,
+            )
+        )
+        self.assertFalse(
+            signal_quality_passes_filter(
+                metadata,
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+                matched_mainline_boards=["芯片概念"],
+                semiconductor_exception_min_breakout_volume_ratio=3.0,
+                semiconductor_exception_max_pullback_volume_ratio=0.60,
+            )
+        )
+        self.assertFalse(
+            signal_quality_passes_filter(
+                {**metadata, "pullback_volume_ratio": 0.65},
+                min_platform_gain_pct=12.0,
+                max_pullback_volume_ratio=0.80,
+                matched_mainline_boards=["存储芯片", "芯片概念"],
+                semiconductor_exception_min_breakout_volume_ratio=3.0,
+                semiconductor_exception_max_pullback_volume_ratio=0.60,
+            )
+        )
+
     def test_attach_turnover_rate_uses_tdx_share_volume_and_float_share_10k_units(self) -> None:
         rows = pd.DataFrame([bar("2026-01-02", 10.0, 10.2, 9.8, 10.0, volume=1_000_000)])
 
@@ -211,23 +310,8 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         self.assertEqual([], tight)
 
     def test_fast_signal_finder_accepts_steady_climb_after_mild_breakout(self) -> None:
-        rows = []
-        for index in range(120):
-            day = str(pd.Timestamp("2025-01-02") + pd.Timedelta(days=index))
-            close = 10.8 + (index % 20) * 0.03
-            rows.append({**bar(day, close, 12.0, 8.8, close, 1000), "turnover_rate": 1.0})
-        rows.extend(
-            [
-                {**bar("2025-05-02", 12.05, 12.25, 11.75, 12.12, 1300), "turnover_rate": 2.0},
-                {**bar("2025-05-03", 12.18, 12.55, 11.85, 12.35, 1200), "turnover_rate": 2.0},
-                {**bar("2025-05-04", 12.35, 12.95, 12.10, 12.80, 1250), "turnover_rate": 2.0},
-                {**bar("2025-05-05", 12.80, 13.35, 12.45, 13.10, 1350), "turnover_rate": 2.0},
-                {**bar("2025-05-06", 13.05, 13.25, 12.70, 12.95, 1050), "turnover_rate": 2.0},
-            ]
-        )
-
         signals = find_jianghua_acceleration_retests_fast(
-            pd.DataFrame(rows),
+            pd.DataFrame(steady_climb_rows()),
             structure_lookback_bars=120,
             min_base_bars=120,
             min_platform_amplitude_pct=35,
@@ -241,7 +325,41 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         self.assertTrue(signals)
         self.assertEqual("steady_climb_retest", signals[0].metadata["pattern_subtype"])
         self.assertLess(signals[0].metadata["flagpole_pct"], 0.22)
-        self.assertGreaterEqual(signals[0].metadata["breakout_volume_ratio"], 1.1)
+        self.assertGreaterEqual(signals[0].metadata["breakout_volume_ratio"], 1.5)
+        self.assertLessEqual(signals[0].metadata["pullback_volume_ratio"], 0.70)
+
+    def test_fast_signal_finder_rejects_steady_climb_without_breakout_volume(self) -> None:
+        signals = find_jianghua_acceleration_retests_fast(
+            pd.DataFrame(steady_climb_rows(breakout_volume=1300)),
+            structure_lookback_bars=120,
+            min_base_bars=120,
+            min_platform_amplitude_pct=35,
+            max_platform_amplitude_pct=100,
+            min_platform_turnover_pct=100,
+            max_platform_gain_pct=20,
+            ma_fast=5,
+            ma_slow=20,
+        )
+
+        self.assertEqual([], signals)
+
+    def test_fast_signal_finder_accepts_mainline_turnover_retest(self) -> None:
+        signals = find_jianghua_acceleration_retests_fast(
+            pd.DataFrame(mainline_turnover_rows()),
+            structure_lookback_bars=120,
+            min_base_bars=120,
+            min_platform_amplitude_pct=35,
+            max_platform_amplitude_pct=100,
+            min_platform_turnover_pct=100,
+            max_platform_gain_pct=20,
+            ma_fast=5,
+            ma_slow=20,
+        )
+
+        self.assertTrue(signals)
+        self.assertEqual("mainline_turnover_retest", signals[0].metadata["pattern_subtype"])
+        self.assertGreater(signals[0].metadata["pullback_volume_ratio"], 0.70)
+        self.assertLessEqual(signals[0].metadata["pullback_volume_ratio"], 1.05)
 
     def test_market_context_builds_breadth_rates_and_filter(self) -> None:
         frames = {
@@ -266,7 +384,17 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         self.assertAlmostEqual(0.5, latest["advance_rate"])
         self.assertAlmostEqual(0.5, latest["above_ma20_rate"])
         self.assertGreater(latest["ret120_p95"], latest["ret120_median"])
-        self.assertTrue(market_context_passes_filter(latest, 0.45, 0.45, 0.0))
+        self.assertFalse(market_context_passes_filter(latest, 0.45, 0.45, 0.0))
+        self.assertTrue(
+            market_context_passes_filter(
+                latest,
+                0.45,
+                0.45,
+                0.0,
+                code="000001",
+                structural_code_pool={"000001"},
+            )
+        )
         self.assertFalse(market_context_passes_filter(latest, 0.60, 0.45, 0.0, allow_structural_bull=False))
 
     def test_market_regime_allows_structural_bull_when_breadth_is_weak_but_leaders_are_strong(self) -> None:
@@ -313,6 +441,63 @@ class JianghuaSuccessBacktestTests(unittest.TestCase):
         ).to_csv(path, index=False)
 
         self.assertEqual({"300750", "688256"}, load_structural_code_pool(path))
+
+    def test_structural_pool_for_signal_uses_latest_prior_dynamic_pool(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "structural_code_pool": {"000001"},
+                "structural_code_pool_by_date": {
+                    "20260410": {"300843"},
+                    "20260417": {"688549"},
+                },
+            },
+        )()
+
+        self.assertEqual({"300843"}, structural_pool_for_signal(args, pd.Timestamp("2026-04-16")))
+
+    def test_stock_matches_structural_theme_by_single_stock_concept_fallback(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "structural_board_pool_by_date": {"20260507": {"存储芯片"}},
+                "structural_board_rank_by_date": {"20260507": {"存储芯片": 5}},
+                "stock_concepts_by_code": {"688549": ["存储芯片"]},
+            },
+        )()
+
+        matched, concepts, matched_boards = stock_matches_structural_theme(
+            args,
+            "688549",
+            pd.Timestamp("2026-05-07"),
+            structural_code_pool=set(),
+        )
+
+        self.assertTrue(matched)
+        self.assertEqual(["存储芯片"], concepts)
+        self.assertEqual(["存储芯片"], matched_boards)
+
+    def test_stock_matches_structural_theme_rejects_single_low_rank_concept(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "structural_board_rank_by_date": {"20260507": {"机器人概念": 7, "无人机": 8}},
+                "stock_concepts_by_code": {"300001": ["机器人概念"]},
+            },
+        )()
+
+        matched, _concepts, matched_boards = stock_matches_structural_theme(
+            args,
+            "300001",
+            pd.Timestamp("2026-05-07"),
+            structural_code_pool=set(),
+        )
+
+        self.assertFalse(matched)
+        self.assertEqual([], matched_boards)
 
     def test_evaluate_signal_marks_success_when_30pct_high_is_reached_within_20_bars(self) -> None:
         rows = [bar("2026-01-02", 10.0, 10.2, 9.8, 10.0)]

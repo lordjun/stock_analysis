@@ -14,6 +14,18 @@ import requests
 import tushare as ts
 
 from kline_model_research import PatternSignal, normalize_price_bars
+from mainline_pool import (
+    DynamicMainlinePoolProvider,
+    MainlinePoolConfig,
+    business_day_snapshot_dates,
+    codes_asof_date,
+    core_mainline_concept_matches,
+    load_or_fetch_stock_concepts,
+    names_asof_date,
+    rank_map_asof_date,
+    parse_theme_keywords,
+    weekly_snapshot_dates,
+)
 from tdx_data import read_tdx_daily_bars
 
 
@@ -53,6 +65,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-platform-amplitude-pct", type=float, default=35.0)
     parser.add_argument("--max-platform-amplitude-pct", type=float, default=100.0)
     parser.add_argument("--max-platform-gain-pct", type=float, default=20.0)
+    parser.add_argument("--min-signal-platform-gain-pct", type=float, default=12.0)
+    parser.add_argument("--max-signal-pullback-volume-ratio", type=float, default=0.80)
+    parser.add_argument("--semiconductor-exception-min-breakout-volume-ratio", type=float, default=3.0)
+    parser.add_argument("--semiconductor-exception-max-pullback-volume-ratio", type=float, default=0.60)
     parser.add_argument("--disable-market-filter", action="store_true")
     parser.add_argument("--market-context-cache", default=None)
     parser.add_argument("--min-market-above-ma20-rate", type=float, default=0.45)
@@ -62,6 +78,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-structural-ret120-p95", type=float, default=0.30)
     parser.add_argument("--min-structural-return-spread", type=float, default=0.35)
     parser.add_argument("--structural-code-pool-file", default=None)
+    parser.add_argument("--mainline-mode", choices=["dynamic", "static", "none"], default="dynamic")
+    parser.add_argument("--dynamic-mainline-cache-dir", default="data/cache/mainline_pools")
+    parser.add_argument("--dynamic-mainline-frequency", choices=["daily", "weekly"], default="daily")
+    parser.add_argument("--structural-concept-top-n", type=int, default=10)
+    parser.add_argument("--structural-concept-lookback-days", type=int, default=540)
+    parser.add_argument("--min-structural-concept-ret60", type=float, default=0.05)
+    parser.add_argument("--min-structural-concept-ret120", type=float, default=0.10)
+    parser.add_argument("--min-structural-concept-ret250", type=float, default=0.20)
+    parser.add_argument("--min-structural-concept-breadth120", type=float, default=0.55)
+    parser.add_argument("--mainline-fallback-top-rank", type=int, default=5)
+    parser.add_argument("--mainline-fallback-min-matches-outside-top-rank", type=int, default=2)
+    parser.add_argument(
+        "--structural-theme-keywords",
+        default="AI,算力,CPO,光模块,机器人,半导体,芯片,6G,数据中心,东数西算,云计算,软件,信创,低空,无人机,卫星,军工信息化,新型工业化,存储,PCB,消费电子",
+    )
     parser.add_argument("--float-share-cache", default=None)
     parser.add_argument("--float-share-provider", choices=["auto", "tdx", "tushare", "eastmoney"], default="auto")
     parser.add_argument("--tdx-base-dbf", default=r"C:\new_tdx\T0002\hq_cache\base.dbf")
@@ -83,12 +114,23 @@ def run(args: argparse.Namespace) -> list[Path]:
 
     universe = fetch_current_non_st_universe(args.limit)
     items = [(str(row.code).zfill(6), str(row.name)) for row in universe.itertuples(index=False)]
+    market_items = items
     args.float_share_by_code = load_float_share_by_code(args)
-    args.structural_code_pool = load_structural_code_pool(args.structural_code_pool_file)
+    args.structural_code_pool_by_date = {}
+    args.structural_board_pool_by_date = {}
+    args.structural_board_rank_by_date = {}
+    args.stock_concepts_by_code = {}
+    args.structural_code_pool = load_backtest_mainline_pool(args)
     args.market_context_by_date = {}
     if not args.disable_market_filter:
-        market_context = load_or_build_market_context(items, args)
+        market_context = load_or_build_market_context(market_items, args)
         args.market_context_by_date = _market_context_lookup(market_context)
+    if should_prefilter_with_structural_pool(args) and args.structural_code_pool:
+        items = [(code, name) for code, name in items if code in args.structural_code_pool]
+        print(
+            f"structural_universe_filter kept={len(items)} original={len(market_items)}",
+            flush=True,
+        )
 
     trade_rows: list[dict[str, object]] = []
     failures: list[dict[str, str]] = []
@@ -129,6 +171,46 @@ def run(args: argparse.Namespace) -> list[Path]:
         flush=True,
     )
     return [summary_path, trades_path, annual_path, similarity_path, failures_path]
+
+
+def load_backtest_mainline_pool(args: argparse.Namespace) -> set[str]:
+    if args.structural_code_pool_file:
+        return load_structural_code_pool(args.structural_code_pool_file)
+    if args.mainline_mode in {"none", "static"}:
+        return set()
+    config = MainlinePoolConfig(
+        cache_dir=Path(args.dynamic_mainline_cache_dir),
+        tdx_vipdoc=args.tdx_vipdoc,
+        lookback_days=args.structural_concept_lookback_days,
+        top_n=args.structural_concept_top_n,
+        min_ret60=args.min_structural_concept_ret60,
+        min_ret120=args.min_structural_concept_ret120,
+        min_ret250=args.min_structural_concept_ret250,
+        min_breadth120=args.min_structural_concept_breadth120,
+        theme_keywords=parse_theme_keywords(args.structural_theme_keywords),
+    )
+    provider = DynamicMainlinePoolProvider(config)
+    snapshot_dates = dynamic_mainline_snapshot_dates(args.signal_start_date, args.signal_end_date, args.dynamic_mainline_frequency)
+    provider.prepare(snapshot_dates)
+    args.structural_code_pool_by_date = {date: provider.codes_for_date(date) for date in snapshot_dates}
+    args.structural_board_pool_by_date = {date: provider.boards_for_date(date) for date in snapshot_dates}
+    args.structural_board_rank_by_date = {date: provider.board_ranks_for_date(date) for date in snapshot_dates}
+    union = provider.union_codes()
+    print(
+        f"dynamic_mainline_ready snapshots={len(snapshot_dates)} union_codes={len(union)}",
+        flush=True,
+    )
+    return union
+
+
+def should_prefilter_with_structural_pool(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "structural_code_pool_file", None))
+
+
+def dynamic_mainline_snapshot_dates(start_date: str, end_date: str, frequency: str) -> list[str]:
+    if frequency == "weekly":
+        return weekly_snapshot_dates(start_date, end_date)
+    return business_day_snapshot_dates(start_date, end_date)
 
 
 def fetch_current_non_st_universe(limit: int | None = None) -> pd.DataFrame:
@@ -435,9 +517,7 @@ def market_context_passes_filter(
         min_structural_ret120_p95,
         min_structural_return_spread,
     )
-    if regime == "broad_bull":
-        return True
-    if regime != "structural_bull":
+    if regime not in {"broad_bull", "structural_bull"}:
         return False
     if not code or not structural_code_pool:
         return False
@@ -551,6 +631,22 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
             args.min_structural_ret120_p95,
             args.min_structural_return_spread,
         )
+        signal_structural_pool = structural_pool_for_signal(args, signal_date)
+        structural_match, stock_concepts, matched_boards = stock_matches_structural_theme(
+            args,
+            code,
+            signal_date,
+            signal_structural_pool,
+        )
+        if not signal_quality_passes_filter(
+            signal.metadata,
+            args.min_signal_platform_gain_pct,
+            args.max_signal_pullback_volume_ratio,
+            matched_mainline_boards=matched_boards,
+            semiconductor_exception_min_breakout_volume_ratio=args.semiconductor_exception_min_breakout_volume_ratio,
+            semiconductor_exception_max_pullback_volume_ratio=args.semiconductor_exception_max_pullback_volume_ratio,
+        ):
+            continue
         if not args.disable_market_filter and not market_context_passes_filter(
             market_context,
             args.min_market_above_ma20_rate,
@@ -560,7 +656,7 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
             args.min_structural_ret120_p95,
             args.min_structural_return_spread,
             code=code,
-            structural_code_pool=args.structural_code_pool,
+            structural_code_pool={str(code).zfill(6)} if structural_match else set(),
         ):
             continue
         row = evaluate_signal(code, name, bars, signal, args.target_return, args.success_bars, args.reversal_bars)
@@ -570,7 +666,9 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
             row.update(
                 {
                     "market_regime": market_regime,
-                    "in_structural_code_pool": str(code).zfill(6) in args.structural_code_pool,
+                    "in_structural_code_pool": structural_match,
+                    "concept_boards": "、".join(stock_concepts),
+                    "matched_mainline_boards": "、".join(matched_boards),
                     "market_stock_count": int(market_context["stock_count"]),
                     "market_advance_rate": round(float(market_context["advance_rate"]), 4),
                     "market_above_ma20_rate": round(float(market_context["above_ma20_rate"]), 4),
@@ -587,6 +685,83 @@ def backtest_one_stock(code: str, name: str, args: argparse.Namespace) -> list[d
         rows.append(row)
         next_allowed_signal_index = int(row["entry_index"]) + args.success_bars
     return rows
+
+
+def structural_pool_for_signal(args: argparse.Namespace, signal_date: pd.Timestamp) -> set[str]:
+    pools_by_date = getattr(args, "structural_code_pool_by_date", {})
+    if pools_by_date:
+        return codes_asof_date(signal_date.strftime("%Y%m%d"), pools_by_date)
+    return getattr(args, "structural_code_pool", set())
+
+
+def signal_quality_passes_filter(
+    metadata: dict[str, object],
+    min_platform_gain_pct: float = 12.0,
+    max_pullback_volume_ratio: float = 0.80,
+    matched_mainline_boards: list[str] | None = None,
+    semiconductor_exception_min_breakout_volume_ratio: float = 3.0,
+    semiconductor_exception_max_pullback_volume_ratio: float = 0.60,
+) -> bool:
+    platform_gain = float(metadata.get("platform_gain_pct", 0.0))
+    pullback_volume_ratio = float(metadata.get("pullback_volume_ratio", 999.0))
+    if platform_gain >= min_platform_gain_pct and pullback_volume_ratio <= max_pullback_volume_ratio:
+        return True
+
+    matched = set(matched_mainline_boards or [])
+    breakout_volume_ratio = float(metadata.get("breakout_volume_ratio", 0.0))
+    return (
+        {"存储芯片", "芯片概念"}.issubset(matched)
+        and breakout_volume_ratio >= semiconductor_exception_min_breakout_volume_ratio
+        and pullback_volume_ratio <= semiconductor_exception_max_pullback_volume_ratio
+    )
+
+
+def structural_boards_for_signal(args: argparse.Namespace, signal_date: pd.Timestamp) -> set[str]:
+    boards_by_date = getattr(args, "structural_board_pool_by_date", {})
+    if boards_by_date:
+        return names_asof_date(signal_date.strftime("%Y%m%d"), boards_by_date)
+    return getattr(args, "structural_board_pool", set())
+
+
+def structural_board_ranks_for_signal(args: argparse.Namespace, signal_date: pd.Timestamp) -> dict[str, int]:
+    ranks_by_date = getattr(args, "structural_board_rank_by_date", {})
+    if ranks_by_date:
+        return rank_map_asof_date(signal_date.strftime("%Y%m%d"), ranks_by_date)
+    return getattr(args, "structural_board_rank", {})
+
+
+def stock_matches_structural_theme(
+    args: argparse.Namespace,
+    code: str,
+    signal_date: pd.Timestamp,
+    structural_code_pool: set[str],
+) -> tuple[bool, list[str], list[str]]:
+    normalized_code = str(code).zfill(6)
+    if normalized_code in structural_code_pool:
+        return True, [], []
+
+    rank_by_board = structural_board_ranks_for_signal(args, signal_date)
+    if not rank_by_board:
+        mainline_boards = structural_boards_for_signal(args, signal_date)
+        rank_by_board = {board: 999 for board in mainline_boards}
+    if not rank_by_board:
+        return False, [], []
+
+    concepts_by_code = getattr(args, "stock_concepts_by_code", {})
+    if normalized_code in concepts_by_code:
+        concepts = list(concepts_by_code[normalized_code])
+    else:
+        concepts = load_or_fetch_stock_concepts(Path(getattr(args, "dynamic_mainline_cache_dir", "data/cache/mainline_pools")), normalized_code)
+        concepts_by_code[normalized_code] = concepts
+        args.stock_concepts_by_code = concepts_by_code
+
+    matched = core_mainline_concept_matches(
+        concepts,
+        rank_by_board,
+        top_rank=int(getattr(args, "mainline_fallback_top_rank", 5)),
+        min_matches_outside_top_rank=int(getattr(args, "mainline_fallback_min_matches_outside_top_rank", 2)),
+    )
+    return bool(matched), concepts, matched
 
 
 def find_jianghua_acceleration_retests_fast(
@@ -613,15 +788,23 @@ def find_jianghua_acceleration_retests_fast(
     ma_fast: int = 20,
     ma_slow: int = 60,
     steady_max_retest_bars: int = 15,
-    steady_min_breakout_volume_ratio: float = 1.10,
-    steady_min_climb_pct: float = 0.08,
-    steady_max_climb_pct: float = 0.25,
+    steady_min_breakout_volume_ratio: float = 1.50,
+    steady_min_climb_pct: float = 0.12,
+    steady_max_climb_pct: float = 0.20,
     steady_support_tolerance: float = 0.03,
-    steady_max_drawdown_pct: float = 0.12,
-    steady_min_close_above_support_pct: float = 0.02,
+    steady_max_drawdown_pct: float = 0.09,
+    steady_min_close_above_support_pct: float = 0.08,
     steady_max_close_above_support_pct: float = 0.18,
-    steady_max_pullback_volume_ratio: float = 1.30,
+    steady_max_pullback_volume_ratio: float = 0.70,
     steady_ma_slow_tolerance: float = 0.005,
+    mainline_min_breakout_volume_ratio: float = 1.50,
+    mainline_min_climb_pct: float = 0.10,
+    mainline_max_climb_pct: float = 0.28,
+    mainline_max_drawdown_pct: float = 0.12,
+    mainline_min_close_above_support_pct: float = 0.05,
+    mainline_max_close_above_support_pct: float = 0.22,
+    mainline_max_pullback_volume_ratio: float = 1.05,
+    mainline_min_trend_quality: float = 0.70,
 ) -> list[PatternSignal]:
     df = normalize_price_bars(bars)
     if df.empty:
@@ -844,6 +1027,109 @@ def find_jianghua_acceleration_retests_fast(
                         "platform_amplitude_pct": float(platform_high[breakout_index] / platform_low[breakout_index] - 1) * 100,
                         "platform_gain_pct": float(platform_end_close[breakout_index] / platform_start_close[breakout_index] - 1) * 100,
                         "pattern_subtype": "steady_climb_retest",
+                        "similarity_score": _steady_climb_similarity_score(
+                            climb_pct=climb_pct,
+                            peak_drawdown_pct=peak_drawdown_pct,
+                            close_above_support_pct=close_above_support_pct,
+                            days_since_breakout=retest_index - breakout_index,
+                            pullback_volume_ratio=pullback_volume_ratio,
+                        ),
+                        "ma_fast": float(ma_fast_values[breakout_index]),
+                        "ma_slow": float(ma_slow_values[breakout_index]),
+                    },
+                )
+            )
+            signaled_indices.add(int(retest_index))
+            break
+
+    mainline_breakout_mask = (
+        (np.arange(len(df)) >= first_breakout)
+        & (np.arange(len(df)) < len(df) - 2)
+        & np.isfinite(structure_high)
+        & np.isfinite(ma_fast_values)
+        & np.isfinite(ma_slow_values)
+        & np.isfinite(prior_avg_volume)
+        & (prior_avg_volume > 0)
+        & (close >= structure_high * (1 + breakout_buffer))
+        & (close > ma_fast_values)
+        & (close > ma_slow_values)
+        & (ma_fast_values >= ma_slow_values * (1 - steady_ma_slow_tolerance))
+        & (volume >= prior_avg_volume * mainline_min_breakout_volume_ratio)
+        & platform_ok
+    )
+    for breakout_index in np.flatnonzero(mainline_breakout_mask):
+        latest_retest_index = min(len(df), breakout_index + steady_max_retest_bars + 1)
+        for retest_index in range(breakout_index + 2, latest_retest_index):
+            if retest_index in signaled_indices:
+                continue
+            climb_highs = high[breakout_index + 1 : retest_index + 1]
+            if len(climb_highs) == 0:
+                continue
+            peak_index = int(breakout_index + 1 + np.argmax(climb_highs))
+            if peak_index >= retest_index:
+                continue
+
+            support_level = float(structure_high[breakout_index])
+            peak_high = float(high[peak_index])
+            climb_pct = peak_high / support_level - 1
+            if not (mainline_min_climb_pct <= climb_pct <= mainline_max_climb_pct):
+                continue
+
+            pullback_low = float(np.min(low[breakout_index + 1 : retest_index + 1]))
+            post_peak_low = float(np.min(low[peak_index : retest_index + 1]))
+            peak_drawdown_pct = 1 - post_peak_low / peak_high
+            latest_close = float(close[retest_index])
+            close_above_support_pct = latest_close / support_level - 1
+            impulse_volume = float(np.mean(volume[breakout_index : peak_index + 1]))
+            pullback_volume = float(np.mean(volume[peak_index + 1 : retest_index + 1]))
+            pullback_volume_ratio = pullback_volume / impulse_volume if impulse_volume else 0.0
+            breakout_volume_ratio = float(volume[breakout_index]) / float(prior_avg_volume[breakout_index])
+            trend_window = close[breakout_index : retest_index + 1] > ma_fast_values[breakout_index : retest_index + 1]
+            trend_quality = float(np.mean(trend_window)) if len(trend_window) else 0.0
+
+            if pullback_low < support_level:
+                continue
+            if latest_close < float(close[breakout_index]):
+                continue
+            if peak_drawdown_pct > mainline_max_drawdown_pct:
+                continue
+            if not (mainline_min_close_above_support_pct <= close_above_support_pct <= mainline_max_close_above_support_pct):
+                continue
+            if pullback_volume_ratio > mainline_max_pullback_volume_ratio:
+                continue
+            if trend_quality < mainline_min_trend_quality:
+                continue
+
+            signals.append(
+                PatternSignal(
+                    model=MODEL_NAME,
+                    signal_index=int(retest_index),
+                    signal_date=pd.Timestamp(dates[retest_index]),
+                    trigger_price=latest_close,
+                    initial_stop=support_level * (1 - steady_support_tolerance),
+                    metadata={
+                        "breakout_index": float(breakout_index),
+                        "peak_index": float(peak_index),
+                        "structure_high": support_level,
+                        "base_low": float(base_low[breakout_index]),
+                        "breakout_close": float(close[breakout_index]),
+                        "breakout_high": float(high[breakout_index]),
+                        "peak_high": peak_high,
+                        "pullback_low": pullback_low,
+                        "days_since_breakout": float(retest_index - breakout_index),
+                        "days_since_peak": float(retest_index - peak_index),
+                        "flagpole_pct": climb_pct,
+                        "peak_drawdown_pct": peak_drawdown_pct,
+                        "close_above_support_pct": close_above_support_pct,
+                        "prior_avg_volume": float(prior_avg_volume[breakout_index]),
+                        "impulse_volume": impulse_volume,
+                        "pullback_volume": pullback_volume,
+                        "pullback_volume_ratio": pullback_volume_ratio,
+                        "breakout_volume_ratio": breakout_volume_ratio,
+                        "platform_turnover_pct": float(platform_turnover[breakout_index]),
+                        "platform_amplitude_pct": float(platform_high[breakout_index] / platform_low[breakout_index] - 1) * 100,
+                        "platform_gain_pct": float(platform_end_close[breakout_index] / platform_start_close[breakout_index] - 1) * 100,
+                        "pattern_subtype": "mainline_turnover_retest",
                         "similarity_score": _steady_climb_similarity_score(
                             climb_pct=climb_pct,
                             peak_drawdown_pct=peak_drawdown_pct,
